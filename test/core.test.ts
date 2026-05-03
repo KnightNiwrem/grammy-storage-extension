@@ -691,6 +691,71 @@ Deno.test("VAL-READ-011 mid-chain decode to undefined triggers single delete", a
   assertEquals(storage.calls.deletes, ["key"]);
 });
 
+Deno.test("VAL-READ-012 chain of exactly MAX_DECODE_DEPTH user codecs roundtrips successfully", async () => {
+  const storage = backing();
+  const codecs = Array.from(
+    { length: MAX_DECODE_DEPTH },
+    (_, index): StorageEnvelopeCodec => {
+      const codec = `depth-codec-${index.toString().padStart(3, "0")}`;
+      const prefix = `prefix-${index.toString().padStart(3, "0")}:`;
+
+      return {
+        codec,
+        version: "1.0.0",
+        encode(envelope) {
+          const codecLength = envelope.codec.length.toString();
+          const versionLength = envelope.version.length.toString();
+          return validEnvelope({
+            codec,
+            version: "1.0.0",
+            payload:
+              `${prefix}${codecLength}:${envelope.codec}${versionLength}:${envelope.version}${envelope.payload}`,
+          });
+        },
+        decode(envelope) {
+          assert(envelope.payload.startsWith(prefix));
+          let cursor = prefix.length;
+          const codecLengthSeparator = envelope.payload.indexOf(":", cursor);
+          const codecLength = Number(
+            envelope.payload.slice(cursor, codecLengthSeparator),
+          );
+          const codecStart = codecLengthSeparator + 1;
+          const codecEnd = codecStart + codecLength;
+          const innerCodec = envelope.payload.slice(codecStart, codecEnd);
+
+          cursor = codecEnd;
+          const versionLengthSeparator = envelope.payload.indexOf(":", cursor);
+          const versionLength = Number(
+            envelope.payload.slice(cursor, versionLengthSeparator),
+          );
+          const versionStart = versionLengthSeparator + 1;
+          const versionEnd = versionStart + versionLength;
+          const innerVersion = envelope.payload.slice(versionStart, versionEnd);
+          const innerPayload = envelope.payload.slice(versionEnd);
+
+          return validEnvelope({
+            codec: innerCodec,
+            version: innerVersion,
+            payload: innerPayload,
+          });
+        },
+      };
+    },
+  );
+  const adapter = createExtendedStorage({
+    storage,
+    codecs,
+  });
+  const value = {
+    message: "exact depth boundary",
+    nested: { count: MAX_DECODE_DEPTH },
+  };
+
+  await adapter.write("key", value);
+
+  assertEquals(await adapter.read("key"), value);
+});
+
 Deno.test("VAL-DEL-001 delete delegates directly to backing storage without codecs", async () => {
   const storage = spyStorage(backing());
   let encodeCalls = 0;

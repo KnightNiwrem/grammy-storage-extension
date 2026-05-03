@@ -43,11 +43,19 @@ export function createExtendedStorage<T>(
     keyToDeleteOnUndefined: string | undefined,
   ): Promise<T | undefined> {
     let current = envelope;
-    for (let depth = 0; depth < MAX_DECODE_DEPTH; depth++) {
+    let userDecodeCount = 0;
+
+    for (;;) {
       assertValidEnvelope(current);
 
       if (current.codec === valueCodec.codec) {
         return valueCodec.decode(current);
+      }
+
+      if (userDecodeCount >= MAX_DECODE_DEPTH) {
+        throw new Error(
+          `Decode depth exceeded MAX_DECODE_DEPTH (${MAX_DECODE_DEPTH})`,
+        );
       }
 
       const codec = codecsById.get(current.codec);
@@ -56,6 +64,7 @@ export function createExtendedStorage<T>(
       }
 
       const next = await codec.decode(current);
+      userDecodeCount++;
       if (next === undefined) {
         if (keyToDeleteOnUndefined !== undefined) {
           await storage.delete(keyToDeleteOnUndefined);
@@ -65,10 +74,6 @@ export function createExtendedStorage<T>(
 
       current = next;
     }
-
-    throw new Error(
-      `Decode depth exceeded MAX_DECODE_DEPTH (${MAX_DECODE_DEPTH})`,
-    );
   }
 
   async function read(key: string): Promise<T | undefined> {
