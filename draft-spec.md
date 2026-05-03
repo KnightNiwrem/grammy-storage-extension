@@ -8,32 +8,34 @@ The extended adapter applies a built-in value codec for `T`, then zero or more u
 
 This design treats `payload` as codec-private and opaque. No codec, other than the codec identified by the current envelope’s `codec`, is required or permitted to interpret that payload.
 
-This design does **not** include a compatibility shim for raw unwrapped legacy values. The backing storage is expected to contain `StorageEnvelope` values only. That is a deliberate difference from grammY’s current helper, which internally uses a compat wrapper. ([GitHub][1])
+This design does **not** include a compatibility shim for raw unwrapped legacy values. The backing storage is expected to contain `StorageEnvelope` values only. That is a deliberate difference from grammY’s current helper, which internally uses a compat wrapper.
 
 ---
 
 ## 2. Core Types
 
 ```ts
+type MaybePromise<T> = T | Promise<T>;
+
 type StorageEnvelope = {
   kind: "grammy-extended-storage-envelope";
   codec: string;
-  version: number;
+  version: string;
   payload: string;
 };
 
 interface StorageEnvelopeCodec {
   readonly codec: string;
-  readonly version: number;
-  encode(envelope: StorageEnvelope): Promise<StorageEnvelope> | StorageEnvelope;
-  decode(envelope: StorageEnvelope): Promise<StorageEnvelope | undefined> | StorageEnvelope | undefined;
+  readonly version: string;
+  encode(envelope: StorageEnvelope): MaybePromise<StorageEnvelope>;
+  decode(envelope: StorageEnvelope): MaybePromise<StorageEnvelope | undefined>;
 }
 
 interface StorageValueCodec<T> {
   readonly codec: string;
-  readonly version: number;
-  encode(value: T): Promise<StorageEnvelope> | StorageEnvelope;
-  decode(envelope: StorageEnvelope): Promise<T | undefined> | T | undefined;
+  readonly version: string;
+  encode(value: T): MaybePromise<StorageEnvelope>;
+  decode(envelope: MaybeStorageEnvelope): Promise<T | undefined>;
 }
 ```
 
@@ -83,15 +85,6 @@ A codec identifier MUST be unique within the installed codec set.
 
 ## 5. Built-in Value Codec
 
-The built-in value codec is conceptually a `StorageValueCodec<T>` with:
-
-```ts
-{
-  codec: "grammy-extended-storage-value",
-  version: 1
-}
-```
-
 ### Built-in Encode Semantics
 
 The built-in value codec MUST encode `T` as:
@@ -100,7 +93,7 @@ The built-in value codec MUST encode `T` as:
 {
   kind: "grammy-extended-storage-envelope",
   codec: "grammy-extended-storage-value",
-  version: 1,
+  version: "1.0.0",
   payload: JSON.stringify(value)
 }
 ```
@@ -114,7 +107,7 @@ The built-in value codec MUST decode by applying `JSON.parse(envelope.payload)` 
 Because the built-in value codec uses JSON:
 
 1. top-level `T` values written through the adapter MUST be JSON-serializable;
-2. top-level `undefined` is not supported as a storable value;
+2. top-level `undefined` is not supported as a storable value, entry is deleted if value is just `undefined`;
 3. runtime preservation of `Date`, `Map`, `Set`, `bigint`, class instances, functions, symbols, cyclic graphs, `NaN`, `Infinity`, and exact `undefined` property semantics is not guaranteed;
 4. the caller is responsible for ensuring the stored runtime shape actually matches `T`.
 
@@ -128,7 +121,7 @@ Any `StorageEnvelope` emitted by the built-in value codec or by a `StorageEnvelo
 
 1. `kind === "grammy-extended-storage-envelope"`;
 2. `codec` is a non-empty string;
-3. `version` is an integer greater than or equal to `0`;
+3. `version` is a SemVer string;
 4. `payload` is a string.
 
 Additionally, any `StorageEnvelopeCodec.encode` implementation MUST emit an envelope whose:
@@ -148,11 +141,10 @@ In other words, the output envelope always identifies the codec that most recent
 
 `encode` MUST:
 
-1. treat the input envelope as the inner envelope being wrapped;
-2. serialize that input envelope into a codec-private `payload` string;
-3. return a new outer envelope that identifies the current codec and version.
+1. serialize that input envelope into a codec-private `payload` string;
+2. return a new outer envelope that identifies the current codec and version.
 
-`encode` MAY use any reversible private string representation for `payload`.
+`encode` MAY implement any reversible private string representation for `payload`.
 
 `encode` MUST NOT return `undefined`.
 
@@ -172,7 +164,6 @@ In other words, the output envelope always identifies the codec that most recent
 * the envelope is malformed;
 * the payload cannot be decoded by this codec;
 * the envelope version is unsupported;
-* the decoded inner value is not a valid `StorageEnvelope` when an envelope is expected.
 
 `decode` MAY return `undefined` to indicate that decoding terminates in logical absence.
 
@@ -199,22 +190,18 @@ Reference algorithm:
 
 ```ts
 async function write(key: string, value: T): Promise<void> {
+  // In actual implementation, the builtin value codec is its own class and file
   let envelope: StorageEnvelope = {
     kind: "grammy-extended-storage-envelope",
     codec: "grammy-extended-storage-value",
-    version: 1,
+    version: "1.0.0",
     payload: JSON.stringify(value),
   };
 
   for (const codec of codecs) {
     envelope = await codec.encode(envelope);
+    // only checks type/shape
     assertValidEnvelope(envelope);
-    if (envelope.codec !== codec.codec) {
-      throw new Error("Codec encode returned envelope with unexpected codec id");
-    }
-    if (envelope.version !== codec.version) {
-      throw new Error("Codec encode returned envelope with unexpected version");
-    }
   }
 
   await storage.write(key, envelope);
@@ -226,7 +213,7 @@ async function write(key: string, value: T): Promise<void> {
 If installed codecs are `[A, B, C]`, the stored value is:
 
 ```ts
-C(B(A(valueEnvelope)))
+C(B(A(value(T))))
 ```
 
 Codec declaration order therefore defines the wrapping order for new writes.
@@ -244,7 +231,7 @@ For `read(key)`:
 5. if it is the built-in value codec id, decode and return `T | undefined`;
 6. otherwise locate the matching installed codec by `codec` id;
 7. invoke that codec’s `decode`;
-8. if decode returns `undefined`, terminate and return `undefined`;
+8. if decode returns `undefined`, terminate, delete this key-value from storage, and return `undefined`;
 9. otherwise continue the loop with the returned inner envelope.
 
 Reference algorithm:
@@ -255,10 +242,12 @@ async function read(key: string): Promise<T | undefined> {
   if (envelope === undefined) return undefined;
 
   for (;;) {
+    // only checks type/shape
     assertValidEnvelope(envelope);
 
+    // In actual implementation, the builtin value codec is its own class and file
     if (envelope.codec === "grammy-extended-storage-value") {
-      if (envelope.version !== 1) {
+      if (envelope.version !== "1.0.0") {
         throw new Error("Unsupported built-in value codec version");
       }
       return JSON.parse(envelope.payload) as T;
@@ -270,7 +259,10 @@ async function read(key: string): Promise<T | undefined> {
     }
 
     const next = await codec.decode(envelope);
-    if (next === undefined) return undefined;
+    if (next === undefined) {
+      await storage.delete(key);
+      return undefined;
+    }
 
     envelope = next;
   }
@@ -299,7 +291,7 @@ async function deleteKey(key: string): Promise<void> {
 
 ## 11. Optional `StorageAdapter` Methods
 
-Because grammY’s `StorageAdapter<T>` also defines optional `has`, `readAllKeys`, `readAllValues`, and `readAllEntries`, the extended adapter SHOULD preserve semantic consistency when exposing them. ([GitHub][1])
+Because grammY’s `StorageAdapter<T>` also defines optional `has`, `readAllKeys`, `readAllValues`, and `readAllEntries`, the extended adapter SHOULD preserve semantic consistency when exposing them.
 
 ## 11.1 `has`
 
@@ -350,7 +342,9 @@ function assertValidEnvelope(value: unknown): asserts value is StorageEnvelope {
   const v = value as Record<string, unknown>;
   if (v.kind !== "grammy-extended-storage-envelope") throw new Error("Invalid envelope kind");
   if (typeof v.codec !== "string" || v.codec.length === 0) throw new Error("Invalid envelope codec");
-  if (!Number.isInteger(v.version) || (v.version as number) < 0) throw new Error("Invalid envelope version");
+  if (typeof v.version !== "string") {
+    throw new Error("Invalid envelope version");
+  }
   if (typeof v.payload !== "string") throw new Error("Invalid envelope payload");
 }
 ```
@@ -364,10 +358,10 @@ The adapter MUST throw on the following conditions:
 1. backing storage returns a non-envelope value;
 2. `kind` is invalid;
 3. `codec` is unknown;
-4. `version` is unsupported by the relevant codec;
+4. `version` is unsupported by the relevant codec (thrown by codec, itself);
 5. a codec returns an invalid envelope;
-6. built-in JSON decoding fails;
-7. a codec fails to decode its payload;
+6. built-in JSON decoding fails (thrown by codec, itself);
+7. a codec fails to decode its payload (thrown by codec, itself);
 8. two installed codecs share the same `codec` identifier.
 
 A codec returning `undefined` from `decode` is **not** an error. It means logical absence and terminates the read with `undefined`.
@@ -436,42 +430,3 @@ This specification does not require:
 3. external tooling that can inspect codec-private payloads;
 4. support for non-JSON top-level values via the built-in value codec;
 5. transparent compatibility with pre-existing raw storage values.
-
----
-
-## 19. Reference Declaration
-
-```ts
-type StorageEnvelope = {
-  kind: "grammy-extended-storage-envelope";
-  codec: string;
-  version: number;
-  payload: string;
-};
-
-interface StorageEnvelopeCodec {
-  readonly codec: string;
-  readonly version: number;
-  encode(envelope: StorageEnvelope): Promise<StorageEnvelope> | StorageEnvelope;
-  decode(envelope: StorageEnvelope): Promise<StorageEnvelope | undefined> | StorageEnvelope | undefined;
-}
-
-interface StorageValueCodec<T> {
-  readonly codec: string;
-  readonly version: number;
-  encode(value: T): Promise<StorageEnvelope> | StorageEnvelope;
-  decode(envelope: StorageEnvelope): Promise<T | undefined> | T | undefined;
-}
-
-function createExtendedStorage<T>(options: {
-  storage: StorageAdapter<StorageEnvelope>;
-  codecs?: readonly StorageEnvelopeCodec[];
-}): StorageAdapter<T>;
-```
-
-## 20. Short rationale for the chosen naming
-
-* `createExtendedStorage` avoids collision with grammY’s existing `enhanceStorage`. ([GitHub][1])
-* `StorageEnvelope` stays intuitive.
-* `StorageEnvelopeCodec` accurately describes a codec that wraps and unwraps envelopes.
-* `grammy-extended-storage-envelope` keeps the discriminator aligned with the factory name.
