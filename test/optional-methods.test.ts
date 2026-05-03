@@ -1,14 +1,8 @@
 import { assert, assertEquals, assertStrictEquals } from "@std/assert";
 import { MemorySessionStorage, type StorageAdapter } from "grammy";
 
-import {
-  BUILTIN_VALUE_CODEC,
-  BUILTIN_VALUE_CODEC_VERSION,
-  createExtendedStorage,
-  STORAGE_ENVELOPE_KIND,
-  type StorageEnvelope,
-  type StorageEnvelopeCodec,
-} from "../src/mod.ts";
+import { createExtendedStorage, type StorageEnvelope } from "../src/mod.ts";
+import { missingCodec, validEnvelope } from "./helpers.ts";
 
 type FlexibleIterable<T> = Iterable<T> | AsyncIterable<T>;
 
@@ -36,35 +30,6 @@ function setMethods(
   return storage;
 }
 
-function validEnvelope(
-  overrides: Partial<StorageEnvelope> = {},
-): StorageEnvelope {
-  return {
-    kind: STORAGE_ENVELOPE_KIND,
-    codec: BUILTIN_VALUE_CODEC,
-    version: BUILTIN_VALUE_CODEC_VERSION,
-    payload: JSON.stringify({ ok: true }),
-    ...overrides,
-  };
-}
-
-function missingCodec(codec: string): StorageEnvelopeCodec {
-  return {
-    codec,
-    version: "1.0.0",
-    encode(envelope) {
-      return validEnvelope({
-        codec,
-        version: "1.0.0",
-        payload: JSON.stringify(envelope),
-      });
-    },
-    decode() {
-      return undefined;
-    },
-  };
-}
-
 async function writeOptionalFixtures(
   storage: FlexibleStorage,
 ): Promise<{
@@ -77,11 +42,24 @@ async function writeOptionalFixtures(
   await storage.write("gone", validEnvelope({ codec: "gone-codec" }));
   await writer.write("b", ["two"]);
 
-  const entries = [
-    ["a", await storage.read("a")],
-    ["gone", await storage.read("gone")],
-    ["b", await storage.read("b")],
-  ] as Array<[string, StorageEnvelope]>;
+  const a = await storage.read("a");
+  if (a === undefined) {
+    throw new Error('Fixture key "a" missing from storage');
+  }
+  const gone = await storage.read("gone");
+  if (gone === undefined) {
+    throw new Error('Fixture key "gone" missing from storage');
+  }
+  const b = await storage.read("b");
+  if (b === undefined) {
+    throw new Error('Fixture key "b" missing from storage');
+  }
+
+  const entries: Array<[string, StorageEnvelope]> = [
+    ["a", a],
+    ["gone", gone],
+    ["b", b],
+  ];
 
   return {
     entries,
@@ -225,6 +203,55 @@ Deno.test("VAL-OPT-009 bulk methods are async-iterable when backing iterables ar
     ["a", { value: 1 }],
     ["b", ["two"]],
   ]);
+});
+
+Deno.test("bulk methods prefer readAllEntries when backing exposes all bulk capabilities", async () => {
+  const storage = backing();
+  const { entries, keys, values } = await writeOptionalFixtures(storage);
+  let readAllKeysCalls = 0;
+  let readAllValuesCalls = 0;
+  let readAllEntriesCalls = 0;
+  setMethods(storage, {
+    readAllKeys: () => {
+      readAllKeysCalls++;
+      return keys;
+    },
+    readAllValues: () => {
+      readAllValuesCalls++;
+      return values;
+    },
+    readAllEntries: () => {
+      readAllEntriesCalls++;
+      return entries;
+    },
+  });
+  const adapter = createExtendedStorage<unknown>({
+    storage,
+    codecs: [missingCodec("gone-codec")],
+  });
+
+  assert(adapter.readAllKeys);
+  assert(adapter.readAllValues);
+  assert(adapter.readAllEntries);
+
+  assertEquals(await collectAsync(adapter.readAllKeys()), ["a", "b"]);
+  assertEquals(readAllKeysCalls, 0);
+  assertEquals(readAllEntriesCalls, 1);
+
+  assertEquals(await collectAsync(adapter.readAllValues()), [
+    { value: 1 },
+    ["two"],
+  ]);
+  assertEquals(readAllValuesCalls, 0);
+  assertEquals(readAllEntriesCalls, 2);
+
+  assertEquals(await collectAsync(adapter.readAllEntries()), [
+    ["a", { value: 1 }],
+    ["b", ["two"]],
+  ]);
+  assertEquals(readAllKeysCalls, 0);
+  assertEquals(readAllValuesCalls, 0);
+  assertEquals(readAllEntriesCalls, 3);
 });
 
 Deno.test("VAL-OPT-010 readAllKeys is exposed when backing has only readAllEntries", async () => {

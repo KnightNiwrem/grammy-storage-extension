@@ -17,6 +17,7 @@ import {
   type StorageEnvelope,
   type StorageEnvelopeCodec,
 } from "../src/mod.ts";
+import { missingCodec, validEnvelope } from "./helpers.ts";
 
 type SpyableStorage = StorageAdapter<StorageEnvelope> & {
   read(
@@ -54,18 +55,6 @@ function spyStorage(
   return Object.assign(storage, { calls });
 }
 
-function validEnvelope(
-  overrides: Partial<StorageEnvelope> = {},
-): StorageEnvelope {
-  return {
-    kind: STORAGE_ENVELOPE_KIND,
-    codec: BUILTIN_VALUE_CODEC,
-    version: BUILTIN_VALUE_CODEC_VERSION,
-    payload: JSON.stringify({ ok: true }),
-    ...overrides,
-  };
-}
-
 function jsonWrappingCodec(
   codec: string,
   options: {
@@ -91,23 +80,6 @@ function jsonWrappingCodec(
       options.onDecode?.(envelope);
       const decoded = JSON.parse(envelope.payload) as StorageEnvelope;
       return options.decodeAsync ? Promise.resolve(decoded) : decoded;
-    },
-  };
-}
-
-function missingCodec(codec: string): StorageEnvelopeCodec {
-  return {
-    codec,
-    version: "1.0.0",
-    encode(envelope) {
-      return validEnvelope({
-        codec,
-        version: "1.0.0",
-        payload: JSON.stringify(envelope),
-      });
-    },
-    decode() {
-      return undefined;
     },
   };
 }
@@ -449,6 +421,68 @@ Deno.test("VAL-WRITE-007 validation runs after every encode step in a multi-code
   );
   assertEquals(cCalls, 0);
   assertEquals(storage.calls.writes.length, 0);
+});
+
+Deno.test("VAL-WRITE-008 codec mismatch", async () => {
+  const storage = spyStorage(backing());
+  const adapter = createExtendedStorage({
+    storage,
+    codecs: [{
+      codec: "declared-codec",
+      version: "1.0.0",
+      encode(envelope) {
+        return validEnvelope({
+          codec: "wrong-codec",
+          version: "1.0.0",
+          payload: JSON.stringify(envelope),
+        });
+      },
+      decode() {
+        return undefined;
+      },
+    }],
+  });
+
+  await assertRejects(
+    async () => {
+      await adapter.write("key", { value: 1 });
+    },
+    Error,
+    "declared-codec",
+  );
+  assertEquals(storage.calls.writes.length, 0);
+  assertEquals(await rawRead(storage, "key"), undefined);
+});
+
+Deno.test("VAL-WRITE-008 version mismatch", async () => {
+  const storage = spyStorage(backing());
+  const adapter = createExtendedStorage({
+    storage,
+    codecs: [{
+      codec: "versioned-codec",
+      version: "1.0.0",
+      encode(envelope) {
+        return validEnvelope({
+          codec: "versioned-codec",
+          version: "2.0.0",
+          payload: JSON.stringify(envelope),
+        });
+      },
+      decode() {
+        return undefined;
+      },
+    }],
+  });
+
+  await assertRejects(
+    async () => {
+      await adapter.write("key", { value: 1 });
+    },
+    Error,
+    "versioned-codec",
+  );
+  assertEquals(storage.calls.writes.length, 0);
+  assertEquals(await rawRead(storage, "key"), undefined);
 });
 
 Deno.test("VAL-READ-001 returns undefined for missing backing entry without decoding", async () => {

@@ -97,6 +97,7 @@ export function createExtendedStorage<T>(
     for (const codec of codecs) {
       envelope = await codec.encode(envelope);
       assertValidEnvelope(envelope);
+      assertEncodeOutputIdentity(codec, envelope);
     }
 
     await storage.write(key, envelope);
@@ -181,20 +182,20 @@ export function createExtendedStorage<T>(
       (await read(key)) !== undefined;
   }
 
-  if (typeof storage.readAllKeys === "function") {
-    adapter.readAllKeys = (): AsyncIterable<string> =>
-      readAllKeysFromKeys(storage.readAllKeys!());
-  } else if (typeof storage.readAllEntries === "function") {
+  if (typeof storage.readAllEntries === "function") {
     adapter.readAllKeys = (): AsyncIterable<string> =>
       readAllKeysFromEntries(storage.readAllEntries!());
+  } else if (typeof storage.readAllKeys === "function") {
+    adapter.readAllKeys = (): AsyncIterable<string> =>
+      readAllKeysFromKeys(storage.readAllKeys!());
   }
 
-  if (typeof storage.readAllValues === "function") {
-    adapter.readAllValues = (): AsyncIterable<T> =>
-      readAllValuesFromValues(storage.readAllValues!());
-  } else if (typeof storage.readAllEntries === "function") {
+  if (typeof storage.readAllEntries === "function") {
     adapter.readAllValues = (): AsyncIterable<T> =>
       readAllValuesFromEntries(storage.readAllEntries!());
+  } else if (typeof storage.readAllValues === "function") {
+    adapter.readAllValues = (): AsyncIterable<T> =>
+      readAllValuesFromValues(storage.readAllValues!());
   }
 
   if (typeof storage.readAllEntries === "function") {
@@ -206,4 +207,25 @@ export function createExtendedStorage<T>(
   }
 
   return adapter;
+}
+
+function assertEncodeOutputIdentity(
+  codec: StorageEnvelopeCodec,
+  envelope: StorageEnvelope,
+): void {
+  const mismatchedFields: string[] = [];
+  if (envelope.codec !== codec.codec) {
+    mismatchedFields.push("codec");
+  }
+  if (envelope.version !== codec.version) {
+    mismatchedFields.push("version");
+  }
+
+  if (mismatchedFields.length > 0) {
+    throw new Error(
+      `Storage envelope codec "${codec.codec}" encode output mismatched ${
+        mismatchedFields.join(" and ")
+      }`,
+    );
+  }
 }
