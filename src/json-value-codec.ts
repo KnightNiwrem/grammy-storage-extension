@@ -1,14 +1,14 @@
 import {
-  BUILTIN_VALUE_CODEC,
-  BUILTIN_VALUE_CODEC_VERSION,
   STORAGE_ENVELOPE_KIND,
+  VALUE_CODEC_ID,
+  VALUE_CODEC_VERSION,
 } from "./constants.ts";
-import type { StorageValueCodec } from "./codec-types.ts";
+import type { StorageValueCodec } from "./codec.ts";
 import type { StorageEnvelope } from "./envelope.ts";
 
-export class BuiltinValueCodec<T> implements StorageValueCodec<T> {
-  readonly codec = BUILTIN_VALUE_CODEC;
-  readonly version = BUILTIN_VALUE_CODEC_VERSION;
+export class JsonValueCodec<T> implements StorageValueCodec<T> {
+  readonly codec = VALUE_CODEC_ID;
+  readonly version = VALUE_CODEC_VERSION;
 
   encode(value: T): StorageEnvelope {
     const payload = JSON.stringify(value);
@@ -29,7 +29,7 @@ export class BuiltinValueCodec<T> implements StorageValueCodec<T> {
   decode(envelope: StorageEnvelope): T | undefined {
     if (envelope.version !== this.version) {
       throw new Error(
-        `Unsupported built-in value codec version: ${envelope.version}`,
+        `Unsupported JSON value codec version: ${envelope.version}`,
       );
     }
     return JSON.parse(envelope.payload) as T;

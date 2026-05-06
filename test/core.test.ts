@@ -7,15 +7,17 @@ import {
 } from "@std/assert";
 import { MemorySessionStorage, type StorageAdapter } from "grammy";
 
+import * as publicApi from "../src/mod.ts";
 import {
   assertValidEnvelope,
-  BUILTIN_VALUE_CODEC,
-  BUILTIN_VALUE_CODEC_VERSION,
   createExtendedStorage,
+  type CreateExtendedStorageOptions,
   MAX_DECODE_DEPTH,
   STORAGE_ENVELOPE_KIND,
   type StorageEnvelope,
   type StorageEnvelopeCodec,
+  VALUE_CODEC_ID,
+  VALUE_CODEC_VERSION,
 } from "../src/mod.ts";
 import { missingCodec, validEnvelope } from "./helpers.ts";
 
@@ -111,7 +113,40 @@ Deno.test("VAL-CONSTR-002 accepts an empty codecs array", async () => {
   assertEquals(await adapter.read("key"), { a: 2 });
 });
 
-Deno.test("VAL-CONSTR-003 rejects duplicate codec identifiers", () => {
+Deno.test("VAL-CONSTR-003 rejects empty codec identifiers", () => {
+  const storage = backing();
+  const codec = jsonWrappingCodec("");
+
+  assertThrows(
+    () => createExtendedStorage({ storage, codecs: [codec] }),
+    Error,
+    "non-empty",
+  );
+});
+
+Deno.test("VAL-CONSTR-004 rejects reserved JSON value codec identifier", () => {
+  const storage = backing();
+  const codec = jsonWrappingCodec(VALUE_CODEC_ID);
+
+  assertThrows(
+    () => createExtendedStorage({ storage, codecs: [codec] }),
+    Error,
+    VALUE_CODEC_ID,
+  );
+});
+
+Deno.test("VAL-CONSTR-005 rejects reserved implementation codec prefix", () => {
+  const storage = backing();
+  const codec = jsonWrappingCodec("grammy-extended-storage-custom");
+
+  assertThrows(
+    () => createExtendedStorage({ storage, codecs: [codec] }),
+    Error,
+    "grammy-extended-storage-custom",
+  );
+});
+
+Deno.test("VAL-CONSTR-006 rejects duplicate codec identifiers", () => {
   const storage = backing();
   const codecA = jsonWrappingCodec("duplicate");
   const codecB = jsonWrappingCodec("duplicate");
@@ -123,18 +158,7 @@ Deno.test("VAL-CONSTR-003 rejects duplicate codec identifiers", () => {
   );
 });
 
-Deno.test("VAL-CONSTR-004 rejects reserved built-in value codec identifier", () => {
-  const storage = backing();
-  const codec = jsonWrappingCodec(BUILTIN_VALUE_CODEC);
-
-  assertThrows(
-    () => createExtendedStorage({ storage, codecs: [codec] }),
-    Error,
-    BUILTIN_VALUE_CODEC,
-  );
-});
-
-Deno.test("VAL-CONSTR-005 codec list is exposed to write in declaration order", async () => {
+Deno.test("VAL-CONSTR-007 codec list is exposed to write in declaration order", async () => {
   const storage = backing();
   const adapter = createExtendedStorage({
     storage,
@@ -150,7 +174,51 @@ Deno.test("VAL-CONSTR-005 codec list is exposed to write in declaration order", 
   assertEquals((await rawRead(storage, "key"))?.codec, "codec-c");
 });
 
-Deno.test("VAL-BIVC-001 encodes value as the canonical envelope shape", async () => {
+Deno.test("VAL-CONSTR-008 mutating codec array after construction does not affect writes", async () => {
+  const storage = backing();
+  const codecs = [jsonWrappingCodec("codec-a")];
+  const adapter = createExtendedStorage({ storage, codecs });
+  codecs.push(jsonWrappingCodec("codec-b"));
+
+  await adapter.write("key", { snapshot: true });
+
+  assertEquals((await rawRead(storage, "key"))?.codec, "codec-a");
+});
+
+Deno.test("VAL-CONSTR-009 encode identity uses construction-time codec metadata", async () => {
+  const storage = backing();
+  const codec: StorageEnvelopeCodec = {
+    codec: "snapshot-codec",
+    version: "1.0.0",
+    encode(envelope) {
+      return validEnvelope({
+        codec: this.codec,
+        version: this.version,
+        payload: JSON.stringify(envelope),
+      });
+    },
+    decode(envelope) {
+      return JSON.parse(envelope.payload) as StorageEnvelope;
+    },
+  };
+  const adapter = createExtendedStorage({ storage, codecs: [codec] });
+
+  Object.assign(codec as unknown as Record<string, string>, {
+    codec: "mutated-codec",
+    version: "2.0.0",
+  });
+
+  await assertRejects(
+    async () => {
+      await adapter.write("key", { snapshot: true });
+    },
+    Error,
+    "snapshot-codec",
+  );
+  assertEquals(await rawRead(storage, "key"), undefined);
+});
+
+Deno.test("VAL-JSVC-001 encodes value as the canonical envelope shape", async () => {
   const storage = backing();
   const adapter = createExtendedStorage({ storage });
   const value = { a: 1, b: ["x", null] };
@@ -159,13 +227,13 @@ Deno.test("VAL-BIVC-001 encodes value as the canonical envelope shape", async ()
 
   assertEquals(await rawRead(storage, "key"), {
     kind: STORAGE_ENVELOPE_KIND,
-    codec: BUILTIN_VALUE_CODEC,
-    version: BUILTIN_VALUE_CODEC_VERSION,
+    codec: VALUE_CODEC_ID,
+    version: VALUE_CODEC_VERSION,
     payload: JSON.stringify(value),
   });
 });
 
-Deno.test("VAL-BIVC-002 decodes envelope by JSON.parse(payload)", async () => {
+Deno.test("VAL-JSVC-002 decodes envelope by JSON.parse(payload)", async () => {
   const storage = backing();
   const adapter = createExtendedStorage<{ parsed: boolean }>({ storage });
   await storage.write("key", validEnvelope({ payload: '{"parsed":true}' }));
@@ -173,7 +241,7 @@ Deno.test("VAL-BIVC-002 decodes envelope by JSON.parse(payload)", async () => {
   assertEquals(await adapter.read("key"), { parsed: true });
 });
 
-Deno.test("VAL-BIVC-003 roundtrips JSON-compatible primitives, arrays, and objects", async () => {
+Deno.test("VAL-JSVC-003 roundtrips JSON-compatible primitives, arrays, and objects", async () => {
   const values = [
     null,
     0,
@@ -195,7 +263,7 @@ Deno.test("VAL-BIVC-003 roundtrips JSON-compatible primitives, arrays, and objec
   }
 });
 
-Deno.test("VAL-BIVC-004 top-level undefined write deletes via storage.delete and never writes", async () => {
+Deno.test("VAL-JSVC-004 top-level undefined write deletes via storage.delete and never writes", async () => {
   const storage = spyStorage(backing());
   const adapter = createExtendedStorage<unknown>({ storage });
 
@@ -211,7 +279,7 @@ Deno.test("VAL-BIVC-004 top-level undefined write deletes via storage.delete and
   assertEquals(await adapter.read("key"), undefined);
 });
 
-Deno.test("VAL-BIVC-005 unsupported built-in value codec version on read throws", async () => {
+Deno.test("VAL-JSVC-005 unsupported JSON value codec version on read throws", async () => {
   const storage = backing();
   const adapter = createExtendedStorage({ storage });
   await storage.write("key", validEnvelope({ version: "2.0.0" }));
@@ -225,7 +293,7 @@ Deno.test("VAL-BIVC-005 unsupported built-in value codec version on read throws"
   );
 });
 
-Deno.test("VAL-BIVC-006 built-in decode throws on unparseable JSON payload", async () => {
+Deno.test("VAL-JSVC-006 JSON value decode throws on unparseable JSON payload", async () => {
   const storage = backing();
   const adapter = createExtendedStorage({ storage });
   await storage.write("key", validEnvelope({ payload: "not valid json" }));
@@ -235,7 +303,7 @@ Deno.test("VAL-BIVC-006 built-in decode throws on unparseable JSON payload", asy
   }, SyntaxError);
 });
 
-Deno.test("VAL-WRITE-001 single user codec wraps the built-in envelope", async () => {
+Deno.test("VAL-WRITE-001 single user codec wraps the JSON value envelope", async () => {
   const storage = backing();
   let calls = 0;
   let input: StorageEnvelope | undefined;
@@ -257,7 +325,7 @@ Deno.test("VAL-WRITE-001 single user codec wraps the built-in envelope", async (
   await adapter.write("key", { value: 1 });
 
   assertEquals(calls, 1);
-  assertEquals(input?.codec, BUILTIN_VALUE_CODEC);
+  assertEquals(input?.codec, VALUE_CODEC_ID);
   assertEquals(await rawRead(storage, "key"), returned);
 });
 
@@ -281,7 +349,7 @@ Deno.test("VAL-WRITE-002 multiple codecs apply in declaration order", async () =
 
   await adapter.write("key", { value: 1 });
 
-  assertEquals(seen, [BUILTIN_VALUE_CODEC, "codec-a", "codec-b"]);
+  assertEquals(seen, [VALUE_CODEC_ID, "codec-a", "codec-b"]);
   assertEquals((await rawRead(storage, "key"))?.codec, "codec-c");
 });
 
@@ -454,7 +522,7 @@ Deno.test("VAL-WRITE-008 codec mismatch", async () => {
   assertEquals(await rawRead(storage, "key"), undefined);
 });
 
-Deno.test("VAL-WRITE-008 version mismatch", async () => {
+Deno.test("VAL-WRITE-009 version mismatch", async () => {
   const storage = spyStorage(backing());
   const adapter = createExtendedStorage({
     storage,
@@ -860,6 +928,17 @@ Deno.test("VAL-ENV-005 rejects non-string payload", () => {
 
 Deno.test("VAL-ENV-006 accepts valid envelopes", () => {
   assertValidEnvelope(validEnvelope());
+});
+
+Deno.test("VAL-EXPORT-001 exposes the public package API surface", () => {
+  const options: CreateExtendedStorageOptions = { storage: backing() };
+
+  assert(options.storage);
+  assertStrictEquals(publicApi.VALUE_CODEC_ID, VALUE_CODEC_ID);
+  assertStrictEquals(publicApi.VALUE_CODEC_VERSION, VALUE_CODEC_VERSION);
+  assertStrictEquals("BUILTIN_VALUE_CODEC" in publicApi, false);
+  assertStrictEquals("BUILTIN_VALUE_CODEC_VERSION" in publicApi, false);
+  assertStrictEquals("StorageValueCodec" in publicApi, false);
 });
 
 Deno.test("VAL-CROSS-001 full chain roundtrip with real grammY MemorySessionStorage", async () => {
