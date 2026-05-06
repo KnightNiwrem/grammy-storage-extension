@@ -19,7 +19,7 @@
   "fmt": {
     "exclude": [
       ".factory/",
-      "draft-spec.md"
+      "spec.md"
     ]
   }
 }

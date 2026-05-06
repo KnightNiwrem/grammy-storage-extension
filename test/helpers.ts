@@ -1,9 +1,9 @@
 import {
-  BUILTIN_VALUE_CODEC,
-  BUILTIN_VALUE_CODEC_VERSION,
   STORAGE_ENVELOPE_KIND,
   type StorageEnvelope,
   type StorageEnvelopeCodec,
+  VALUE_CODEC_ID,
+  VALUE_CODEC_VERSION,
 } from "../src/mod.ts";
 
 export function validEnvelope(
@@ -11,8 +11,8 @@ export function validEnvelope(
 ): StorageEnvelope {
   return {
     kind: STORAGE_ENVELOPE_KIND,
-    codec: BUILTIN_VALUE_CODEC,
-    version: BUILTIN_VALUE_CODEC_VERSION,
+    codec: VALUE_CODEC_ID,
+    version: VALUE_CODEC_VERSION,
     payload: JSON.stringify({ ok: true }),
     ...overrides,
   };

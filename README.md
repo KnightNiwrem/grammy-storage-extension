@@ -29,4 +29,7 @@ const value = await storage.read("chat:1");
 console.log(value); // { count: 1 }
 ```
 
-See [`draft-spec.md`](./draft-spec.md) for the full specification.
+> This adapter expects backing storage to contain `StorageEnvelope` values only.
+> It does not automatically migrate raw legacy session values.
+
+See [`spec.md`](./spec.md) for the full specification.

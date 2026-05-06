@@ -76,7 +76,7 @@ async function collectAsync<T>(iterable: FlexibleIterable<T>): Promise<T[]> {
   return values;
 }
 
-Deno.test("VAL-OPT-001 has is exposed iff backing has and uses read semantics", async () => {
+Deno.test("VAL-OPT-001 has is exposed and uses wrapped read semantics", async () => {
   const storage = backing();
   const writer = createExtendedStorage<unknown>({ storage });
 
@@ -94,11 +94,13 @@ Deno.test("VAL-OPT-001 has is exposed iff backing has and uses read semantics", 
   assertEquals(await storage.read("gone"), undefined);
 });
 
-Deno.test("VAL-OPT-002 has is omitted when backing adapter does not expose has", () => {
+Deno.test("VAL-OPT-002 has is exposed when backing adapter does not expose has", async () => {
   const storage = setMethods(backing(), { has: undefined });
   const adapter = createExtendedStorage<unknown>({ storage });
 
-  assertStrictEquals(adapter.has, undefined);
+  assertStrictEquals(typeof adapter.has, "function");
+  assert(adapter.has);
+  assertEquals(await adapter.has("missing"), false);
 });
 
 Deno.test("VAL-OPT-003 readAllKeys yields only keys whose decoded value is not undefined", async () => {

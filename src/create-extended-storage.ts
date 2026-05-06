@@ -1,8 +1,8 @@
 import type { StorageAdapter } from "grammy";
 
-import { BuiltinValueCodec } from "./builtin-codec.ts";
-import { BUILTIN_VALUE_CODEC, MAX_DECODE_DEPTH } from "./constants.ts";
-import type { StorageEnvelopeCodec } from "./codec-types.ts";
+import { JsonValueCodec } from "./json-value-codec.ts";
+import { MAX_DECODE_DEPTH, VALUE_CODEC_ID } from "./constants.ts";
+import type { StorageEnvelopeCodec } from "./codec.ts";
 import { assertValidEnvelope, type StorageEnvelope } from "./envelope.ts";
 
 export type CreateExtendedStorageOptions = {
@@ -19,23 +19,17 @@ type StorageAdapterCapabilities = StorageAdapter<StorageEnvelope> & {
   readAllEntries?: () => MaybeAsyncIterable<[string, StorageEnvelope]>;
 };
 
+type InstalledEnvelopeCodec = {
+  readonly id: string;
+  readonly version: string;
+  readonly impl: StorageEnvelopeCodec;
+};
+
 export function createExtendedStorage<T>(
   options: CreateExtendedStorageOptions,
 ): StorageAdapter<T> {
-  const codecs = options.codecs ?? [];
-  const codecsById = new Map<string, StorageEnvelopeCodec>();
-
-  for (const codec of codecs) {
-    if (codec.codec === BUILTIN_VALUE_CODEC) {
-      throw new Error(`Reserved storage envelope codec id: ${codec.codec}`);
-    }
-    if (codecsById.has(codec.codec)) {
-      throw new Error(`Duplicate storage envelope codec id: ${codec.codec}`);
-    }
-    codecsById.set(codec.codec, codec);
-  }
-
-  const valueCodec = new BuiltinValueCodec<T>();
+  const installed = installCodecs(options.codecs);
+  const valueCodec = new JsonValueCodec<T>();
   const storage = options.storage as StorageAdapterCapabilities;
 
   async function decodeEnvelope(
@@ -58,12 +52,12 @@ export function createExtendedStorage<T>(
         );
       }
 
-      const codec = codecsById.get(current.codec);
+      const codec = installed.byId.get(current.codec);
       if (codec === undefined) {
         throw new Error(`Unknown storage envelope codec: ${current.codec}`);
       }
 
-      const next = await codec.decode(current);
+      const next = await codec.impl.decode(current);
       userDecodeCount++;
       if (next === undefined) {
         if (keyToDeleteOnUndefined !== undefined) {
@@ -94,8 +88,8 @@ export function createExtendedStorage<T>(
     let envelope = valueCodec.encode(value);
     assertValidEnvelope(envelope);
 
-    for (const codec of codecs) {
-      envelope = await codec.encode(envelope);
+    for (const codec of installed.ordered) {
+      envelope = await codec.impl.encode(envelope);
       assertValidEnvelope(envelope);
       assertEncodeOutputIdentity(codec, envelope);
     }
@@ -177,10 +171,8 @@ export function createExtendedStorage<T>(
     delete: deleteKey,
   };
 
-  if (typeof storage.has === "function") {
-    adapter.has = async (key: string): Promise<boolean> =>
-      (await read(key)) !== undefined;
-  }
+  adapter.has = async (key: string): Promise<boolean> =>
+    (await read(key)) !== undefined;
 
   if (typeof storage.readAllEntries === "function") {
     adapter.readAllKeys = (): AsyncIterable<string> =>
@@ -209,12 +201,49 @@ export function createExtendedStorage<T>(
   return adapter;
 }
 
+function installCodecs(
+  codecs: readonly StorageEnvelopeCodec[] = [],
+): {
+  readonly ordered: readonly InstalledEnvelopeCodec[];
+  readonly byId: ReadonlyMap<string, InstalledEnvelopeCodec>;
+} {
+  const ordered: InstalledEnvelopeCodec[] = [];
+  const byId = new Map<string, InstalledEnvelopeCodec>();
+
+  for (const impl of codecs) {
+    const id = impl.codec;
+
+    if (id.length === 0) {
+      throw new Error("Storage envelope codec id must be non-empty");
+    }
+
+    if (id === VALUE_CODEC_ID || id.startsWith("grammy-extended-storage-")) {
+      throw new Error(`Reserved storage envelope codec id: ${id}`);
+    }
+
+    if (byId.has(id)) {
+      throw new Error(`Duplicate storage envelope codec id: ${id}`);
+    }
+
+    const installed: InstalledEnvelopeCodec = {
+      id,
+      version: impl.version,
+      impl,
+    };
+
+    ordered.push(installed);
+    byId.set(id, installed);
+  }
+
+  return { ordered, byId };
+}
+
 function assertEncodeOutputIdentity(
-  codec: StorageEnvelopeCodec,
+  codec: InstalledEnvelopeCodec,
   envelope: StorageEnvelope,
 ): void {
   const mismatchedFields: string[] = [];
-  if (envelope.codec !== codec.codec) {
+  if (envelope.codec !== codec.id) {
     mismatchedFields.push("codec");
   }
   if (envelope.version !== codec.version) {
@@ -223,7 +252,7 @@ function assertEncodeOutputIdentity(
 
   if (mismatchedFields.length > 0) {
     throw new Error(
-      `Storage envelope codec "${codec.codec}" encode output mismatched ${
+      `Storage envelope codec "${codec.id}" encode output mismatched ${
         mismatchedFields.join(" and ")
       }`,
     );
