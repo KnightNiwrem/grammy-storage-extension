@@ -1,70 +1,144 @@
-# Extended Storage Adapter Specification
+# @grammyjs/storage-extended: Architectural & API Specification
 
-## 1. Overview
+An advanced, middleware-like session storage wrapper for the [grammY bot framework](https://grammy.dev/).
 
-`createExtendedStorage` constructs a grammY-compatible `StorageAdapter<T>` on top of a backing `StorageAdapter<StorageEnvelope>`.
+---
 
-The extended adapter stores only validated storage envelopes in the backing storage. It does not store raw `T` values.
+## 1. Overview & Architecture
 
-On write, the adapter:
+`@grammyjs/storage-extended` provides a layered session storage adapter (`StorageAdapter<T>`) built on top of an underlying raw storage engine (`StorageAdapter<StorageEnvelope>`). 
 
-1. treats top-level `undefined` as deletion;
-2. encodes `T` with the mandatory JSON value codec;
-3. applies zero or more user-supplied envelope codecs in declaration order;
-4. writes the final outer envelope to the backing storage.
+Instead of storing raw, unstructured session objects directly in the database, this extension encapsulates the session state inside a structured metadata envelope (`StorageEnvelope`). The adapter then runs a pipeline of **Envelope Codecs** that recursively serialize, encrypt, compress, or sign the data as it flows into and out of storage.
 
-On read, the adapter:
+### 1.1 Serialization (Write) Pipeline
 
-1. reads an envelope from backing storage;
-2. validates the envelope shape;
-3. dispatches decoding by the envelope's `codec` field;
-4. repeats until the mandatory JSON value codec is reached or a codec returns `undefined`.
+When writing data, the session state is first serialized into a JSON envelope. Then, user-defined codecs are applied sequentially in the **order of their declaration** (from first to last):
 
-The design is intentionally data-driven on read. The current envelope decides which codec decodes it. Codec array order does not control read dispatch.
+```
+Raw Session State (T)
+         │
+         ▼
+ ┌───────────────┐
+ │  Value Codec  │  <-- Encodes session state (T) into initial JSON payload
+ └───────────────┘
+         │
+         ▼   [Core Envelope]
+ ┌───────────────┐
+ │    Codec A    │  <-- First user-supplied layer (e.g. Compression)
+ └───────────────┘
+         │
+         ▼   [Compressed Envelope]
+ ┌───────────────┐
+ │    Codec B    │  <-- Second user-supplied layer (e.g. Encryption)
+ └───────────────┘
+         │
+         ▼   [Compressed & Encrypted Envelope]
+ ┌───────────────┐
+ │  Raw Storage  │  <-- Outermost envelope written to backing database
+ └───────────────┘
+```
 
-This specification does **not** define compatibility for raw, unwrapped legacy values. Existing backing storage data must already be migrated to `StorageEnvelope` values before this adapter is used.
+### 1.2 Deserialization (Read) Pipeline
 
-## 2. Terminology
+Unlike the write pipeline, reading is **data-driven**, not order-driven. The adapter inspects the `codec` identifier of the envelope retrieved from storage, locates the matching codec, and decodes it. This process repeats recursively until it reaches the core JSON Value Codec:
 
-**Extended adapter** means the `StorageAdapter<T>` returned by `createExtendedStorage`.
+```
+                  ┌───────────────┐
+                  │  Raw Storage  │  <-- Reads outermost envelope
+                  └───────────────┘
+                          │
+                          ▼   [Enveloped Data]
+                  ┌───────────────┐
+                  │  Route Codec  │  <-- Inspects `envelope.codec`
+                  └───────────────┘
+                          │
+            ┌─────────────┴─────────────┐
+            ▼ (codec === "aes-gcm")     ▼ (codec === "value")
+    ┌───────────────┐           ┌───────────────┐
+    │    Codec B    │           │  Value Codec  │
+    └───────────────┘           └───────────────┘
+            │                           │
+            ▼ [Compressed Envelope]     ▼
+    ┌───────────────┐           ┌───────────────┐
+    │    Route      │           │ Return state T│
+    └───────────────┘           └───────────────┘
+            │
+            ▼ (codec === "gzip")
+    ┌───────────────┐
+    │    Codec A    │
+    └───────────────┘
+            │
+            ▼ [Core Envelope]
+    ┌───────────────┐
+    │  Value Codec  │
+    └───────────────┘
+            │
+            ▼
+     Return state T
+```
 
-**Backing storage** means the underlying `StorageAdapter<StorageEnvelope>` passed to `createExtendedStorage`.
+> [!IMPORTANT]
+> **No Legacy Compatibility**: This specification does **not** provide fallback parsing for raw, unwrapped legacy database entries. Any pre-existing database contents must be migrated to `StorageEnvelope` format before activating this adapter.
 
-**Storage envelope** means the validated object stored in backing storage and exchanged between codecs.
+---
 
-**JSON value codec** means the mandatory internal terminal codec that converts between `T` and a `StorageEnvelope` using `JSON.stringify` and `JSON.parse`.
+## 2. Core Domain Concepts
 
-**Envelope codec** means a user-supplied `StorageEnvelopeCodec` that wraps and unwraps existing storage envelopes.
+| Concept | Description |
+| :--- | :--- |
+| **Layered Adapter** | The `StorageAdapter<T>` returned by `createExtendedStorage` that wraps the underlying storage. |
+| **Underlying Storage** | The physical database adapter (e.g., Redis, MongoDB, Memory) that reads and writes `StorageEnvelope` objects. |
+| **Storage Envelope** | The standardized JSON transport object (`StorageEnvelope`) stored in the underlying database. |
+| **Value Codec** | The mandatory, internal serializer that converts the rich session state `T` to/from the core `StorageEnvelope`. |
+| **Envelope Codec** | A middleware-like plugin (`StorageEnvelopeCodec`) that takes a `StorageEnvelope` and encodes its payload into another outer `StorageEnvelope`. |
+| **Implicit Deletion (Tombstoning)** | A design pattern where a codec's `decode` returns `undefined` (indicating the session has expired or failed validation), triggering automatic removal of that key from storage. |
 
-**Logical absence** means a decoded result of `undefined`. Logical absence is not an error. When the key is known, the adapter deletes that key from backing storage.
+---
 
-## 3. Core API
+## 3. Public API Contracts
 
-```ts
+```typescript
 import type { StorageAdapter } from "grammy";
 
 export type MaybePromise<T> = T | Promise<T>;
 
+/**
+ * The standardized container stored physically in the database.
+ */
 export type StorageEnvelope = {
-  kind: typeof STORAGE_ENVELOPE_KIND;
-  codec: string;
-  version: string;
-  payload: string;
-};
-
-export interface StorageEnvelopeCodec {
+  readonly kind: typeof STORAGE_ENVELOPE_KIND;
   readonly codec: string;
   readonly version: string;
+  readonly payload: string;
+};
 
+/**
+ * Interface implemented by custom codec plugins (e.g., encryption, compression).
+ */
+export interface StorageEnvelopeCodec {
+  /** A unique identifier representing this codec family (e.g., "aes-gcm"). */
+  readonly codec: string;
+
+  /** The current version of the write format produced by this codec (e.g., "1.0.0"). */
+  readonly version: string;
+
+  /** Wraps an inner envelope into an outer envelope. */
   encode(envelope: StorageEnvelope): MaybePromise<StorageEnvelope>;
 
+  /**
+   * Unwraps an outer envelope back into its inner envelope.
+   * Returns `undefined` if the envelope represents a tombstoned or expired session.
+   */
   decode(
     envelope: StorageEnvelope,
   ): MaybePromise<StorageEnvelope | undefined>;
 }
 
 export type CreateExtendedStorageOptions = {
+  /** The physical database adapter to read/write envelopes. */
   storage: StorageAdapter<StorageEnvelope>;
+  
+  /** Optional ordered array of envelope wrapping layers. */
   codecs?: readonly StorageEnvelopeCodec[];
 };
 
@@ -73,353 +147,230 @@ export function createExtendedStorage<T>(
 ): StorageAdapter<T>;
 ```
 
-The JSON value codec is mandatory and internal. It is not configurable through the public factory API.
+### 3.1 Serialization Constraints
+The JSON Value Codec is internal and mandatory. Custom serialization algorithms (e.g. MessagePack) are not supported at the value-codec level unless the public factory API is extended to expose value-codec customization.
 
-An implementation may define an internal `StorageValueCodec<T>` type, but that type is not a public extension point unless the public API explicitly exposes value-codec customization.
+---
 
-## 4. Reserved Identifiers
+## 4. Spec Constants & Reserved Identifiers
 
-The following specification constants are reserved:
+The following identifier constants are reserved by the implementation:
 
-```ts
+```typescript
 export const STORAGE_ENVELOPE_KIND = "grammy-extended-storage-envelope" as const;
 export const VALUE_CODEC_ID = "grammy-extended-storage-value" as const;
 export const VALUE_CODEC_VERSION = "1.0.0" as const;
 export const MAX_DECODE_DEPTH = 100 as const;
 ```
 
-User-supplied envelope codecs MUST NOT use:
-
-1. an empty codec identifier;
-2. `VALUE_CODEC_ID`;
-3. any codec identifier beginning with `grammy-extended-storage-`.
-
-The prefix `grammy-extended-storage-` is reserved for implementation-owned envelope kinds and codec identifiers.
-
-User-supplied codec identifiers SHOULD be globally namespaced. Examples:
-
-```txt
-npm:@example/grammy-storage-codecs/aes-gcm
-jsr:@example/grammy-storage-codecs/gzip
-com.example.telegram.session.crypto
-```
-
-A codec identifier MUST be unique within the installed codec set.
-
-## 5. JSON Value Codec
-
-The JSON value codec is the terminal codec. No user-supplied codec participates after it on read.
-
-### 5.1 Encode Semantics
-
-For a defined value `value: T`, the JSON value codec encodes as:
-
-```ts
-{
-  kind: STORAGE_ENVELOPE_KIND,
-  codec: VALUE_CODEC_ID,
-  version: VALUE_CODEC_VERSION,
-  payload: JSON.stringify(value),
-}
-```
-
-If `JSON.stringify(value)` does not return a string, encoding MUST throw.
-
-The extended adapter MUST special-case top-level `undefined` before value encoding. Calling `write(key, undefined)` MUST delete `key` from backing storage instead of attempting to store JSON text.
-
-### 5.2 Decode Semantics
-
-The JSON value codec MUST decode only envelopes whose:
-
-```ts
-envelope.codec === VALUE_CODEC_ID
-envelope.version === VALUE_CODEC_VERSION
-```
-
-If the version is unsupported, decoding MUST throw.
-
-If the version is supported, decoding returns:
-
-```ts
-JSON.parse(envelope.payload) as T
-```
-
-If JSON parsing fails, the error MUST propagate.
-
-### 5.3 Value Constraints
-
-Because the JSON value codec uses normal JSON semantics:
-
-1. values written through the adapter must be JSON-serializable;
-2. top-level `undefined` is deletion, not a storable value;
-3. `Date`, `Map`, `Set`, `bigint`, class instances, functions, symbols, cyclic graphs, `NaN`, `Infinity`, and exact `undefined` property semantics are not preserved as rich JavaScript values;
-4. callers are responsible for ensuring that the stored runtime shape actually matches `T`.
-
-The adapter does not perform schema validation for `T`.
-
-## 6. Envelope Invariants
-
-Every envelope read from backing storage and every envelope returned by a codec MUST satisfy:
-
-1. the value is a non-null object;
-2. the value is not an array;
-3. `kind === STORAGE_ENVELOPE_KIND`;
-4. `codec` is a non-empty string;
-5. `version` is a string;
-6. `payload` is a string.
-
-`version` is an opaque string to the adapter. Codec authors SHOULD use SemVer or another stable documented versioning scheme, but the adapter MUST NOT parse or enforce SemVer.
-
-The adapter MUST validate envelope shape at runtime when crossing a storage or codec boundary. These runtime checks protect stored data integrity. The adapter is not required to duplicate TypeScript's structural checks for every caller-supplied codec object.
-
-## 7. Envelope Codec Contract
-
-### 7.1 `StorageEnvelopeCodec.codec`
-
-`codec` identifies a codec family.
-
-A codec family SHOULD keep a stable `codec` identifier across compatible historical versions and use `version` to distinguish payload formats.
-
-Changing `codec` means the implementation is treated as a different codec family.
-
-### 7.2 `StorageEnvelopeCodec.version`
-
-`version` identifies the current write format produced by `encode`.
-
-The adapter treats `version` as opaque. A codec's own `decode` implementation is responsible for accepting or rejecting the versions for that codec family.
-
-### 7.3 `StorageEnvelopeCodec.encode`
-
-`encode` accepts a valid inner `StorageEnvelope` and returns a valid outer `StorageEnvelope`.
-
-`encode` MUST:
-
-1. serialize the input envelope into a codec-private payload string;
-2. return an envelope whose `codec` equals the installed codec identifier;
-3. return an envelope whose `version` equals the installed codec version;
-4. return an envelope whose `payload` is a string;
-5. never return `undefined`.
-
-The adapter MUST validate the returned envelope. The adapter MUST also verify that the returned envelope identifies the codec that produced it.
-
-### 7.4 `StorageEnvelopeCodec.decode`
-
-`decode` accepts a valid envelope whose `codec` matches the installed codec identifier.
-
-`decode` returns either:
-
-1. the next inner `StorageEnvelope`; or
-2. `undefined` to indicate logical absence.
-
-`decode` MAY support multiple historical versions for the same codec identifier.
-
-`decode` MUST throw when its payload cannot be decoded, when the envelope version is unsupported, or when the envelope is otherwise invalid for that codec's private format.
-
-A codec returning `undefined` from `decode` is not an error.
-
-## 8. Construction Rules
-
-`createExtendedStorage` MUST:
-
-1. accept a backing `StorageAdapter<StorageEnvelope>`;
-2. normalize missing `options.codecs` to an empty installed codec set;
-3. reject user codecs with empty codec identifiers;
-4. reject user codecs using reserved implementation identifiers;
-5. reject duplicate codec identifiers;
-6. build a dispatch map keyed by codec identifier;
-7. return a grammY-compatible `StorageAdapter<T>`.
-
-The installed codec set is fixed at construction time. Later mutation of `options.codecs` MUST NOT add, remove, reorder, or otherwise change the adapter's installed codec set.
-
-The installed codec identifier and installed codec version for each codec are fixed at construction time for adapter-level routing and encode-output identity checks.
-
-The adapter SHOULD rely on TypeScript for ordinary structural validation of caller-provided codec objects. Runtime construction checks are required only for storage-integrity invariants such as empty identifiers, reserved identifiers, and duplicate identifiers.
-
-## 9. Write Semantics
-
-For `write(key, value)`:
-
-1. if `value === undefined`, call `storage.delete(key)` and return;
-2. encode `value` with the JSON value codec;
-3. validate the resulting envelope;
-4. for each installed envelope codec in declaration order:
-   1. call `codec.encode(currentEnvelope)`;
-   2. validate the returned envelope;
-   3. verify that returned `codec` and `version` match the installed codec metadata;
-   4. use the returned envelope as the new current envelope;
-5. write the final envelope to backing storage.
-
-If installed codecs are `[A, B, C]`, the stored value is wrapped as:
-
-```txt
-C(B(A(JSON(T))))
-```
-
-Codec declaration order therefore defines the wrapping order for new writes.
-
-## 10. Read Semantics
-
-For `read(key)`:
-
-1. call `storage.read(key)`;
-2. if backing storage returns `undefined`, return `undefined`;
-3. treat the returned value as the current envelope;
-4. validate the current envelope;
-5. inspect `current.codec`;
-6. if `current.codec === VALUE_CODEC_ID`, decode with the JSON value codec and return `T | undefined`;
-7. otherwise locate the installed envelope codec by `current.codec`;
-8. if no codec is installed for `current.codec`, throw;
-9. invoke that codec's `decode(current)`;
-10. if decode returns `undefined`, delete `key` from backing storage and return `undefined`;
-11. otherwise treat the returned envelope as current and repeat.
-
-Read routing is data-driven, not order-driven. Reordering `options.codecs` changes the wrapping order of future writes, but existing stored values remain readable as long as every required codec identifier is still installed and each codec supports the stored versions.
-
-The adapter MUST enforce a maximum user-codec decode depth. The default maximum is `MAX_DECODE_DEPTH`. If the maximum is exceeded, the adapter MUST throw.
-
-## 11. Delete Semantics
-
-`delete(key)` MUST delegate directly to backing storage:
-
-```ts
-await storage.delete(key);
-```
-
-## 12. Optional StorageAdapter Methods
-
-The extended adapter MUST expose `has`, even when the backing storage does not expose `has`.
-
-The extended adapter MAY expose `readAllKeys`, `readAllValues`, and `readAllEntries` when the backing storage exposes enough capability to implement them correctly.
-
-Returned bulk methods MAY be `AsyncIterable` even when the backing storage exposes synchronous iterables, because decoding may be asynchronous.
-
-### 12.1 `has`
-
-`has(key)` MUST be semantically equivalent to:
-
-```ts
-return (await read(key)) !== undefined;
-```
-
-It MUST NOT simply forward `storage.has(key)` unless forwarding is provably equivalent to wrapped `read` semantics.
-
-Because `has` uses wrapped `read`, it may trigger the same cleanup side effects as `read` when decoding terminates in logical absence.
-
-### 12.2 `readAllKeys`
-
-If exposed, `readAllKeys()` MUST yield only keys whose decoded value is not `undefined`.
-
-A correct implementation may:
-
-1. iterate backing entries and decode each entry; or
-2. iterate backing keys and call wrapped `read(key)` for each key.
-
-### 12.3 `readAllValues`
-
-If exposed, `readAllValues()` MUST yield only decoded values that are not `undefined`.
-
-A correct implementation may:
-
-1. iterate backing entries and decode each entry; or
-2. iterate backing values and decode each value.
-
-When deriving `readAllValues()` from backing values alone, the adapter cannot delete entries whose decoded result is logical absence, because no key is available.
-
-### 12.4 `readAllEntries`
-
-If exposed, `readAllEntries()` MUST yield only `[key, value]` pairs whose decoded value is not `undefined`.
-
-A correct implementation may:
-
-1. iterate backing entries and decode each entry; or
-2. iterate backing keys and call wrapped `read(key)` for each key.
-
-## 13. Validation Rules
-
-`assertValidEnvelope` MUST verify at minimum:
-
-```ts
-export function assertValidEnvelope(
-  value: unknown,
-): asserts value is StorageEnvelope {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("Invalid envelope: expected a non-null object");
+### 4.1 Custom Codec Constraints
+User-supplied `StorageEnvelopeCodec` objects must adhere to the following naming rules:
+1. **No Empty Identifiers**: The `codec` string cannot be empty.
+2. **No Value Codec Hijacking**: The `codec` string cannot equal `VALUE_CODEC_ID`.
+3. **No Prefix Collisions**: The `codec` string cannot begin with `grammy-extended-storage-`.
+
+> [!TIP]
+> Custom codec identifiers should be globally namespaced to prevent collisions (e.g. `npm:@my-org/codec-aes-gcm` or `jsr:@my-org/codec-lz4`).
+
+---
+
+## 5. Terminal JSON Value Codec
+
+The `JsonValueCodec` is the core terminal serializer in the read/write pipeline.
+
+### 5.1 Encoding
+For any defined session value `value: T`:
+- It MUST serialize the value using `JSON.stringify(value)`.
+- It MUST return a `StorageEnvelope` structure:
+  ```json
+  {
+    "kind": "grammy-extended-storage-envelope",
+    "codec": "grammy-extended-storage-value",
+    "version": "1.0.0",
+    "payload": "<JSON string>"
   }
+  ```
+- If stringification fails or produces `undefined`, encoding MUST throw an error.
+- **Top-Level `undefined` Special Case**: Before encoding, the adapter MUST intercept top-level `undefined` session writes, treating them as deletion requests (delegated directly to `storage.delete(key)`), bypassing the serialization pipeline.
 
-  const envelope = value as Record<string, unknown>;
+### 5.2 Decoding
+When encountering an envelope with `codec === VALUE_CODEC_ID`:
+- The adapter MUST verify that `version === VALUE_CODEC_VERSION`.
+- If the version mismatches, decoding MUST throw an error.
+- If the version is correct, it MUST return `JSON.parse(envelope.payload) as T`.
+- Any JSON parsing exceptions MUST propagate up as errors.
 
-  if (envelope.kind !== STORAGE_ENVELOPE_KIND) {
-    throw new Error("Invalid envelope kind");
-  }
+### 5.3 Rich Types Limitation
+Because serialization relies on standard JSON:
+- Sessions must be JSON-serializable.
+- Rich JS classes and types (`Date`, `Map`, `Set`, `bigint`, cyclic graphs, functions, and symbols) are **not preserved** and will be degraded or raise serialization exceptions.
 
-  if (typeof envelope.codec !== "string" || envelope.codec.length === 0) {
-    throw new Error("Invalid envelope codec");
-  }
+---
 
-  if (typeof envelope.version !== "string") {
-    throw new Error("Invalid envelope version");
-  }
+## 6. Runtime Invariant Validations
 
-  if (typeof envelope.payload !== "string") {
-    throw new Error("Invalid envelope payload");
-  }
-}
+To protect storage integrity, the adapter MUST execute runtime validation of envelopes whenever data crosses a boundary (upon reading from storage, and before/after passing data to any custom codec).
+
+An object is validated by `assertValidEnvelope(value)` and must satisfy:
+1. The value is a non-null `object`.
+2. The value is not an array.
+3. The `kind` property matches `STORAGE_ENVELOPE_KIND` exactly.
+4. The `codec` property is a non-empty string.
+5. The `version` property is a string.
+6. The `payload` property is a string.
+
+Failure to satisfy any of these conditions MUST throw an immediate validation error.
+
+---
+
+## 7. Custom Envelope Codec Contract
+
+Custom codecs (e.g., for encryption or compression) must comply with the following contracts:
+
+### 7.1 `codec` property
+Acts as the identifier for the codec family. It must remain stable across different versions of the format.
+
+### 7.2 `version` property
+Represents the format version produced by `encode()`. The adapter treats this as an opaque string, but codec authors should use semantic versioning (SemVer) to manage format transitions.
+
+### 7.3 `encode(envelope)`
+- **Input**: A validated inner `StorageEnvelope`.
+- **Output**: A validated outer `StorageEnvelope` wrapping the inner envelope.
+- **Rules**:
+  - The returned envelope's `codec` and `version` fields MUST match the codec's declared properties.
+  - The inner envelope MUST be serialized into the output's `payload` string.
+  - `encode` MUST NEVER return `undefined`.
+
+### 7.4 `decode(envelope)`
+- **Input**: A validated outer `StorageEnvelope` owned by this codec family.
+- **Output**: The next inner `StorageEnvelope`, or `undefined` to signal implicit session expiration/deletion.
+- **Rules**:
+  - The codec's `decode` is responsible for handling historical version backward compatibility.
+  - It MUST throw an error if the payload cannot be decrypted, decompressed, or parsed, or if the format version is unsupported.
+
+---
+
+## 8. Construction & Initialization
+
+When calling `createExtendedStorage(options)`:
+1. **Normalisation**: If `options.codecs` is missing, default to an empty list.
+2. **Uniqueness**: Ensure that no two codecs share the same `codec` identifier.
+3. **Validation**: Check each codec against the reserved identifier rules.
+4. **Immutability**: The set of codecs and their metadata is fixed at construction time. Subsequent mutation of the source options array MUST NOT alter the adapter's behavior.
+
+---
+
+## 9. Write Pipeline Flow
+
+When the bot writes session data via `write(key, value)`:
+
+1. **Delete Interception**: If `value === undefined`, invoke `storage.delete(key)` and return immediately.
+2. **Initial Serialization**: Serialize the session state using the internal terminal JSON Value Codec.
+3. **Shape Check**: Run `assertValidEnvelope` on the serialized envelope.
+4. **Layer Application**: For each custom codec in the `codecs` option, in **command order** (declaration order):
+   1. Invoke `codec.encode(currentEnvelope)`.
+   2. Run `assertValidEnvelope` on the output.
+   3. Verify that the output's `codec` and `version` match the codec's registered properties.
+   4. Update `currentEnvelope` to this output.
+5. **Physical Storage**: Save the final outermost envelope to the underlying storage using `storage.write(key, currentEnvelope)`.
+
+---
+
+## 10. Read & Decoding Pipeline Flow
+
+When the bot requests session data via `read(key)`:
+
+1. **Physical Read**: Fetch the entry from underlying storage.
+2. **Miss Handling**: If the database returns `undefined`, return `undefined` immediately.
+3. **Loop Initialization**: Set the retrieved envelope as `currentEnvelope` and set `decodeDepth = 0`.
+4. **Decoding Loop**:
+   1. Run `assertValidEnvelope(currentEnvelope)`.
+   2. **Terminal Case**: If `currentEnvelope.codec === VALUE_CODEC_ID`, decode it using the JSON Value Codec and return the decoded session object `T` to the caller.
+   3. **Depth Check**: If `decodeDepth >= MAX_DECODE_DEPTH`, throw a recursion loop error.
+   4. **Codec Lookup**: Find the registered custom codec matching `currentEnvelope.codec`. If not found, throw an error.
+   5. **Execution**: Pass the envelope to the custom codec's `decode` method.
+   6. **Tombstone Case**: If `decode` returns `undefined` (tombstone / logical absence):
+      1. Trigger an automatic cleanup call: `await storage.delete(key)`.
+      2. Halt processing and return `undefined` to the caller.
+   7. **Progress**: Increment `decodeDepth`, set `currentEnvelope` to the decoded inner envelope, and repeat the loop.
+
+> [!NOTE]
+> **Data-Driven Routing**: Because decoding routes dynamically via the `codec` metadata on the envelopes, changing the sequence of `codecs` in the options does not break the ability to read pre-existing data, as long as all required codecs remain registered.
+
+---
+
+## 11. Deletion & Tombstones
+
+```
+               Direct Delete
+            ───────────────────►  [storage.delete(key)]
+            
+            
+            Implicit Delete (during read decode)
+            [decode(env)] ───► returns undefined (Tombstone)
+                                    │
+                                    ▼
+                          [storage.delete(key)]
 ```
 
-A validation failure MUST throw.
+- **Direct Deletion**: `delete(key)` bypasses the codec pipeline and invokes the underlying storage's `delete` method directly.
+- **Implicit Cleanup**: When a custom codec indicates that a session is expired or revoked (by returning `undefined` from `decode`), the adapter automatically executes a database cleanup delete for that key.
 
-## 14. Error Semantics
+---
 
-The adapter MUST throw on at least the following conditions:
+## 12. Optional Bulk Capabilities
 
-1. backing storage returns a non-envelope value;
-2. envelope `kind` is invalid;
-3. envelope `codec` is missing or empty;
-4. envelope `version` is not a string;
-5. envelope `payload` is not a string;
-6. a user codec identifier is empty at construction;
-7. a user codec identifier is reserved at construction;
-8. two installed codecs share the same codec identifier;
-9. an envelope references an unknown codec identifier;
-10. a codec returns an invalid envelope;
-11. a codec `encode` output does not identify the installed codec and version;
-12. JSON value encoding cannot produce a string payload;
-13. JSON value decoding receives an unsupported version;
-14. JSON parsing fails;
-15. a user codec rejects an unsupported version;
-16. a user codec fails to decode its private payload;
-17. the maximum decode depth is exceeded.
+If the underlying storage supports bulk capabilities, the layered adapter selectively exposes them if they can be implemented soundly.
 
-The adapter SHOULD allow codec-thrown errors to propagate.
+### 12.1 `has(key)`
+- Always exposed.
+- Implemented as: `(await read(key)) !== undefined`.
+- **Warning**: Calling `has` performs a full read/decode cycle, meaning it may trigger implicit deletion side-effects if a session has expired. It must **not** forward blindly to the underlying storage's `.has()` method.
 
-A codec returning `undefined` from `decode` is not an error. It means logical absence.
+### 12.2 `readAllKeys()`
+Exposed if the underlying storage implements `readAllEntries` or `readAllKeys`.
+- Yields only keys whose sessions successfully decode and do not evaluate to `undefined`.
+- If the underlying storage implements `readAllEntries()`, it iterates over the entries and decodes each envelope.
+- Otherwise, it falls back to iterating backing keys and executing a full `read(key)` for each key.
 
-## 15. Progress Requirement
+### 12.3 `readAllValues()`
+Exposed if the underlying storage implements `readAllEntries` or `readAllValues`.
+- Yields only fully decoded session values of type `T` (filtering out `undefined` tombstones).
+- **Caveat**: If deriving values solely from `readAllValues` without keys, the adapter cannot delete tombstones from the underlying database because the keys are unavailable.
 
-A codec decode chain MUST make progress toward the JSON value codec or logical absence.
+### 12.4 `readAllEntries()`
+Exposed if the underlying storage implements `readAllEntries` or `readAllKeys`.
+- Yields `[key, T]` pairs where `T !== undefined`.
+- Prefers iterating entries, but falls back to iterating keys and fetching each key.
 
-A codec implementation MUST NOT create an infinite decode loop by repeatedly returning envelopes that keep the system at the same logical decode step forever.
+---
 
-The adapter MUST enforce `MAX_DECODE_DEPTH` as a defensive guard. The guard does not prove semantic progress; it only prevents unbounded loops.
+## 13. Error Reference Matrix
 
-## 16. Backing Storage Requirements
+The adapter guarantees that errors are thrown under the following circumstances:
 
-The backing storage passed to `createExtendedStorage` MUST be treated as `StorageAdapter<StorageEnvelope>`.
+| Phase | Failure Trigger | Thrown Error Context / Type |
+| :--- | :--- | :--- |
+| **Construction** | A codec identifier is empty or invalid. | Construction validation error. |
+| **Construction** | Two codecs declare the identical identifier. | Duplicate registration error. |
+| **Construction** | A codec uses `grammy-extended-storage-value` or prefixes. | Reserved namespace violation. |
+| **Runtime Write** | Output of `JSON.stringify` is invalid/undefined. | Serialization failure. |
+| **Runtime Write** | A codec returns an object that fails shape invariants. | Post-encode validation error. |
+| **Runtime Write** | A codec's output `codec`/`version` doesn't match its ID. | Identity verification failure. |
+| **Runtime Read** | Database returns an object failing envelope invariants. | Pre-decode validation error. |
+| **Runtime Read** | Value codec version is not `1.0.0`. | Version unsupported error. |
+| **Runtime Read** | JSON parsing of terminal payload fails. | Parse error propagation. |
+| **Runtime Read** | Envelope codec identifier is not registered. | Unknown codec routing error. |
+| **Runtime Read** | Decode chain depth hits `MAX_DECODE_DEPTH`. | Recursion loop guard error. |
+| **Runtime Read** | A codec fails to decode internally. | Propagation of codec's thrown error. |
 
-The backing storage MUST contain only valid `StorageEnvelope` values for keys read by the extended adapter.
+---
 
-The caller is responsible for migrating existing raw `T` values before using this adapter. This specification does not define an implicit migration path from raw values to envelopes.
+## 14. Non-Goals
 
-## 17. Non-Goals
-
-This specification does not require:
-
-1. SemVer validation;
-2. schema validation for `T`;
-3. broad runtime validation of TypeScript codec object shape;
-4. canonical serialization of inner envelopes across user codecs;
-5. generic decoding by unrelated codecs;
-6. external tooling that can inspect codec-private payloads;
-7. support for non-JSON top-level values through the mandatory JSON value codec;
-8. transparent compatibility with pre-existing raw storage values;
-9. configurable replacement of the JSON value codec.
+This specification does **not** mandate or cover:
+- Semantic Versioning (SemVer) format validation by the adapter.
+- Custom validation schemas for the user session type `T`.
+- Transparent support for legacy raw database values (migration is the caller's responsibility).
+- Replacement of the terminal JSON Value Codec with other serialization systems.
+- Codec-private payload inspection by the core adapter.
