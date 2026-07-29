@@ -3,6 +3,10 @@ import {
   VALUE_CODEC_ID,
   VALUE_CODEC_VERSION,
 } from "./constants.ts";
+import {
+  EXTENDED_STORAGE_ERROR_CODES,
+  ExtendedStorageError,
+} from "./errors.ts";
 import type { StorageValueCodec } from "./codec.ts";
 import type { StorageEnvelope } from "./envelope.ts";
 
@@ -13,7 +17,8 @@ export class JsonValueCodec<T> implements StorageValueCodec<T> {
   encode(value: T): StorageEnvelope {
     const payload = JSON.stringify(value);
     if (typeof payload !== "string") {
-      throw new Error(
+      throw new ExtendedStorageError(
+        EXTENDED_STORAGE_ERROR_CODES.VALUE_SERIALIZATION,
         "Value cannot be encoded as a JSON storage envelope payload",
       );
     }
@@ -28,7 +33,8 @@ export class JsonValueCodec<T> implements StorageValueCodec<T> {
 
   decode(envelope: StorageEnvelope): T | undefined {
     if (envelope.version !== this.version) {
-      throw new Error(
+      throw new ExtendedStorageError(
+        EXTENDED_STORAGE_ERROR_CODES.UNSUPPORTED_VALUE_VERSION,
         `Unsupported JSON value codec version: ${envelope.version}`,
       );
     }

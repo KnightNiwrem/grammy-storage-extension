@@ -7,7 +7,7 @@ yet reflect.
   - Make all fields of `StorageEnvelope` in `src/envelope.ts` `readonly` to
     match the spec's public type contract.
 
-- [ ] **Error taxonomy** (spec §3, §6, §13)
+- [x] **Error taxonomy** (spec §3, §6, §13)
   - Add `src/errors.ts` defining `ExtendedStorageError extends Error` with a
     `readonly code` field, the `EXTENDED_STORAGE_ERROR_CODES` constant object,
     and the `ExtendedStorageErrorCode` union type; export all three from

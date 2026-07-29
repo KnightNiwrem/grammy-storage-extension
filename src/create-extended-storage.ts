@@ -2,6 +2,10 @@ import type { StorageAdapter } from "grammy";
 
 import { JsonValueCodec } from "./json-value-codec.ts";
 import { MAX_DECODE_DEPTH, VALUE_CODEC_ID } from "./constants.ts";
+import {
+  EXTENDED_STORAGE_ERROR_CODES,
+  ExtendedStorageError,
+} from "./errors.ts";
 import type { StorageEnvelopeCodec } from "./codec.ts";
 import { assertValidEnvelope, type StorageEnvelope } from "./envelope.ts";
 
@@ -47,14 +51,18 @@ export function createExtendedStorage<T>(
       }
 
       if (userDecodeCount >= MAX_DECODE_DEPTH) {
-        throw new Error(
+        throw new ExtendedStorageError(
+          EXTENDED_STORAGE_ERROR_CODES.DECODE_DEPTH_EXCEEDED,
           `Decode depth exceeded MAX_DECODE_DEPTH (${MAX_DECODE_DEPTH})`,
         );
       }
 
       const codec = installed.byId.get(current.codec);
       if (codec === undefined) {
-        throw new Error(`Unknown storage envelope codec: ${current.codec}`);
+        throw new ExtendedStorageError(
+          EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_CODEC,
+          `Unknown storage envelope codec: ${current.codec}`,
+        );
       }
 
       const next = await codec.impl.decode(current);
@@ -214,15 +222,24 @@ function installCodecs(
     const id = impl.codec;
 
     if (id.length === 0) {
-      throw new Error("Storage envelope codec id must be non-empty");
+      throw new ExtendedStorageError(
+        EXTENDED_STORAGE_ERROR_CODES.EMPTY_CODEC_ID,
+        "Storage envelope codec id must be non-empty",
+      );
     }
 
     if (id === VALUE_CODEC_ID || id.startsWith("grammy-extended-storage-")) {
-      throw new Error(`Reserved storage envelope codec id: ${id}`);
+      throw new ExtendedStorageError(
+        EXTENDED_STORAGE_ERROR_CODES.RESERVED_CODEC_ID,
+        `Reserved storage envelope codec id: ${id}`,
+      );
     }
 
     if (byId.has(id)) {
-      throw new Error(`Duplicate storage envelope codec id: ${id}`);
+      throw new ExtendedStorageError(
+        EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_CODEC_ID,
+        `Duplicate storage envelope codec id: ${id}`,
+      );
     }
 
     const installed: InstalledEnvelopeCodec = {
@@ -251,7 +268,8 @@ function assertEncodeOutputIdentity(
   }
 
   if (mismatchedFields.length > 0) {
-    throw new Error(
+    throw new ExtendedStorageError(
+      EXTENDED_STORAGE_ERROR_CODES.CODEC_IDENTITY_MISMATCH,
       `Storage envelope codec "${codec.id}" encode output mismatched ${
         mismatchedFields.join(" and ")
       }`,

@@ -6,6 +6,11 @@ export {
 } from "./constants.ts";
 export { assertValidEnvelope } from "./envelope.ts";
 export type { StorageEnvelope } from "./envelope.ts";
+export {
+  EXTENDED_STORAGE_ERROR_CODES,
+  ExtendedStorageError,
+} from "./errors.ts";
+export type { ExtendedStorageErrorCode } from "./errors.ts";
 export type { MaybePromise, StorageEnvelopeCodec } from "./codec.ts";
 export { createExtendedStorage } from "./create-extended-storage.ts";
 export type {
