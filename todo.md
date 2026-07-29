@@ -12,10 +12,10 @@ yet reflect.
     `readonly code` field, the `EXTENDED_STORAGE_ERROR_CODES` constant object,
     and the `ExtendedStorageErrorCode` union type; export all three from
     `src/mod.ts`.
-  - Replace every plain `Error` thrown by the adapter (construction
-    validation, `assertValidEnvelope`, `JsonValueCodec`, write identity check,
-    unknown-codec routing, depth guard) with `ExtendedStorageError` carrying
-    the code listed in spec §13.
+  - Replace every plain `Error` thrown by the adapter (construction validation,
+    `assertValidEnvelope`, `JsonValueCodec`, write identity check, unknown-codec
+    routing, depth guard) with `ExtendedStorageError` carrying the code listed
+    in spec §13.
   - Codec-thrown errors and `JSON.parse` errors must continue to propagate
     unchanged.
   - Update tests to assert on `code` rather than message strings.
@@ -39,5 +39,5 @@ yet reflect.
     default).
   - Update the depth-limit error message and add tests covering: the default
     heuristic, an explicit option value, invalid option values, and decode
-    chains that legitimately reuse the same codec beyond the registered
-    codec count.
+    chains that legitimately reuse the same codec beyond the registered codec
+    count.
