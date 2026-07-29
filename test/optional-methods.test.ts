@@ -312,3 +312,24 @@ Deno.test("VAL-OPT-012 readAllEntries is exposed when backing has readAllKeys on
     ["b", ["two"]],
   ]);
 });
+
+Deno.test("VAL-OPT-013 bulk iteration ignores tombstone cleanup delete failures", async () => {
+  const storage = backing();
+  const { entries } = await writeOptionalFixtures(storage);
+  setMethods(storage, {
+    readAllEntries: () => entries,
+    delete: () => Promise.reject(new Error("cleanup exploded")),
+  });
+  const adapter = createExtendedStorage<unknown>({
+    storage,
+    codecs: [missingCodec("gone-codec")],
+  });
+
+  assert(adapter.readAllKeys);
+  assert(adapter.readAllEntries);
+  assertEquals(await collectAsync(adapter.readAllKeys()), ["a", "b"]);
+  assertEquals(await collectAsync(adapter.readAllEntries()), [
+    ["a", { value: 1 }],
+    ["b", ["two"]],
+  ]);
+});

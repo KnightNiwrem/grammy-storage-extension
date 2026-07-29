@@ -20,7 +20,7 @@ yet reflect.
     unchanged.
   - Update tests to assert on `code` rather than message strings.
 
-- [ ] **Best-effort tombstone cleanup** (spec §10.4.6, §11)
+- [x] **Best-effort tombstone cleanup** (spec §10.4.6, §11)
   - In `decodeEnvelope` (`src/create-extended-storage.ts`), wrap the cleanup
     `storage.delete(keyToDeleteOnUndefined)` call so a delete failure does not
     propagate; the decode must still return `undefined`.

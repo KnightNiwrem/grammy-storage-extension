@@ -69,7 +69,13 @@ export function createExtendedStorage<T>(
       userDecodeCount++;
       if (next === undefined) {
         if (keyToDeleteOnUndefined !== undefined) {
-          await storage.delete(keyToDeleteOnUndefined);
+          try {
+            await storage.delete(keyToDeleteOnUndefined);
+          } catch {
+            // Best-effort cleanup (spec section 10.4.6): the session was
+            // already determined to be logically absent, so a failed
+            // cleanup delete must not propagate.
+          }
         }
         return undefined;
       }

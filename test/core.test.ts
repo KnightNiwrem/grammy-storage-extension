@@ -910,6 +910,21 @@ Deno.test("VAL-READ-012 chain of exactly MAX_DECODE_DEPTH user codecs roundtrips
   assertEquals(await adapter.read("key"), value);
 });
 
+Deno.test("VAL-READ-013 tombstone cleanup delete failure does not propagate", async () => {
+  const storage = backing();
+  const adapter = createExtendedStorage({
+    storage,
+    codecs: [missingCodec("gone-codec")],
+  });
+  await storage.write(
+    "key",
+    validEnvelope({ codec: "gone-codec", payload: "" }),
+  );
+  storage.delete = () => Promise.reject(new Error("cleanup exploded"));
+
+  assertEquals(await adapter.read("key"), undefined);
+});
+
 Deno.test("VAL-DEL-001 delete delegates directly to backing storage without codecs", async () => {
   const storage = spyStorage(backing());
   let encodeCalls = 0;
