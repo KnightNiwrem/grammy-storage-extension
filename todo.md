@@ -27,7 +27,7 @@ yet reflect.
   - Add tests covering cleanup-delete failure on both the single-read path and
     bulk iteration paths.
 
-- [ ] **Configurable decode depth limit** (spec §4, §8, §10, §13)
+- [x] **Configurable decode depth limit** (spec §4, §8, §10, §13)
   - Add `maxDecodeDepth?: number` to `CreateExtendedStorageOptions` in
     `src/create-extended-storage.ts`.
   - Validate at construction: if provided, it must be a positive integer,

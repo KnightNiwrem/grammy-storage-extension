@@ -228,6 +228,20 @@ Deno.test("VAL-CONSTR-009 encode identity uses construction-time codec metadata"
   assertEquals(await rawRead(storage, "key"), undefined);
 });
 
+Deno.test("VAL-CONSTR-010 rejects non-positive-integer maxDecodeDepth", () => {
+  for (const maxDecodeDepth of [0, -1, 1.5, NaN]) {
+    const error = assertThrows(
+      () => createExtendedStorage({ storage: backing(), maxDecodeDepth }),
+      ExtendedStorageError,
+      "maxDecodeDepth",
+    );
+    assertEquals(
+      error.code,
+      EXTENDED_STORAGE_ERROR_CODES.INVALID_MAX_DECODE_DEPTH,
+    );
+  }
+});
+
 Deno.test("VAL-JSVC-001 encodes value as the canonical envelope shape", async () => {
   const storage = backing();
   const adapter = createExtendedStorage({ storage });
@@ -750,7 +764,8 @@ Deno.test("VAL-READ-008 decode-depth guard fires", async () => {
     error.code,
     EXTENDED_STORAGE_ERROR_CODES.DECODE_DEPTH_EXCEEDED,
   );
-  assert(calls <= MAX_DECODE_DEPTH);
+  // With one registered codec the default limit is 1 + 16.
+  assertStrictEquals(calls, 17);
 });
 
 Deno.test("VAL-READ-009 async decode is supported", async () => {
@@ -923,6 +938,80 @@ Deno.test("VAL-READ-013 tombstone cleanup delete failure does not propagate", as
   storage.delete = () => Promise.reject(new Error("cleanup exploded"));
 
   assertEquals(await adapter.read("key"), undefined);
+});
+
+Deno.test("VAL-READ-014 explicit maxDecodeDepth bounds the decode chain", async () => {
+  const storage = backing();
+  let calls = 0;
+  const selfLoop = validEnvelope({ codec: "loop-codec", payload: "loop" });
+  const adapter = createExtendedStorage({
+    storage,
+    codecs: [{
+      codec: "loop-codec",
+      version: "1.0.0",
+      encode() {
+        return selfLoop;
+      },
+      decode() {
+        calls++;
+        return selfLoop;
+      },
+    }],
+    maxDecodeDepth: 3,
+  });
+  await storage.write("key", selfLoop);
+
+  const error = await assertRejects(
+    async () => {
+      await adapter.read("key");
+    },
+    ExtendedStorageError,
+    "(3)",
+  );
+  assertEquals(
+    error.code,
+    EXTENDED_STORAGE_ERROR_CODES.DECODE_DEPTH_EXCEEDED,
+  );
+  assertStrictEquals(calls, 3);
+});
+
+Deno.test("VAL-READ-015 default maxDecodeDepth is codecs.length + 16", async () => {
+  const codec = jsonWrappingCodec("repeat-codec");
+  const buildChain = async (depth: number): Promise<StorageEnvelope> => {
+    let envelope = validEnvelope({ payload: JSON.stringify({ deep: true }) });
+    for (let index = 0; index < depth; index++) {
+      envelope = await codec.encode(envelope);
+    }
+    return envelope;
+  };
+
+  // A single registered codec legitimately decodes 17 (1 + 16) layers of
+  // repeat-wrapped historical data.
+  const okStorage = backing();
+  await okStorage.write("key", await buildChain(17));
+  const okAdapter = createExtendedStorage({
+    storage: okStorage,
+    codecs: [codec],
+  });
+  assertEquals(await okAdapter.read("key"), { deep: true });
+
+  const failStorage = backing();
+  await failStorage.write("key", await buildChain(18));
+  const failAdapter = createExtendedStorage({
+    storage: failStorage,
+    codecs: [codec],
+  });
+  const error = await assertRejects(
+    async () => {
+      await failAdapter.read("key");
+    },
+    ExtendedStorageError,
+    "(17)",
+  );
+  assertEquals(
+    error.code,
+    EXTENDED_STORAGE_ERROR_CODES.DECODE_DEPTH_EXCEEDED,
+  );
 });
 
 Deno.test("VAL-DEL-001 delete delegates directly to backing storage without codecs", async () => {

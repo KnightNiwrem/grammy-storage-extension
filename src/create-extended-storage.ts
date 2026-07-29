@@ -1,7 +1,7 @@
 import type { StorageAdapter } from "grammy";
 
 import { JsonValueCodec } from "./json-value-codec.ts";
-import { MAX_DECODE_DEPTH, VALUE_CODEC_ID } from "./constants.ts";
+import { VALUE_CODEC_ID } from "./constants.ts";
 import {
   EXTENDED_STORAGE_ERROR_CODES,
   ExtendedStorageError,
@@ -12,6 +12,7 @@ import { assertValidEnvelope, type StorageEnvelope } from "./envelope.ts";
 export type CreateExtendedStorageOptions = {
   storage: StorageAdapter<StorageEnvelope>;
   codecs?: readonly StorageEnvelopeCodec[];
+  maxDecodeDepth?: number;
 };
 
 type MaybeAsyncIterable<T> = Iterable<T> | AsyncIterable<T>;
@@ -33,6 +34,10 @@ export function createExtendedStorage<T>(
   options: CreateExtendedStorageOptions,
 ): StorageAdapter<T> {
   const installed = installCodecs(options.codecs);
+  const maxDecodeDepth = resolveMaxDecodeDepth(
+    options.maxDecodeDepth,
+    installed.ordered.length,
+  );
   const valueCodec = new JsonValueCodec<T>();
   const storage = options.storage as StorageAdapterCapabilities;
 
@@ -50,10 +55,10 @@ export function createExtendedStorage<T>(
         return valueCodec.decode(current);
       }
 
-      if (userDecodeCount >= MAX_DECODE_DEPTH) {
+      if (userDecodeCount >= maxDecodeDepth) {
         throw new ExtendedStorageError(
           EXTENDED_STORAGE_ERROR_CODES.DECODE_DEPTH_EXCEEDED,
-          `Decode depth exceeded MAX_DECODE_DEPTH (${MAX_DECODE_DEPTH})`,
+          `Decode depth exceeded maxDecodeDepth (${maxDecodeDepth})`,
         );
       }
 
@@ -213,6 +218,24 @@ export function createExtendedStorage<T>(
   }
 
   return adapter;
+}
+
+function resolveMaxDecodeDepth(
+  value: number | undefined,
+  codecCount: number,
+): number {
+  if (value === undefined) {
+    return codecCount + 16;
+  }
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new ExtendedStorageError(
+      EXTENDED_STORAGE_ERROR_CODES.INVALID_MAX_DECODE_DEPTH,
+      `Invalid maxDecodeDepth: expected a positive integer, got ${value}`,
+    );
+  }
+
+  return value;
 }
 
 function installCodecs(
