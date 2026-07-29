@@ -1,13 +1,18 @@
 import type { StorageAdapter } from "grammy";
 
 import { JsonValueCodec } from "./json-value-codec.ts";
-import { MAX_DECODE_DEPTH, VALUE_CODEC_ID } from "./constants.ts";
+import { VALUE_CODEC_ID } from "./constants.ts";
+import {
+  EXTENDED_STORAGE_ERROR_CODES,
+  ExtendedStorageError,
+} from "./errors.ts";
 import type { StorageEnvelopeCodec } from "./codec.ts";
 import { assertValidEnvelope, type StorageEnvelope } from "./envelope.ts";
 
 export type CreateExtendedStorageOptions = {
   storage: StorageAdapter<StorageEnvelope>;
   codecs?: readonly StorageEnvelopeCodec[];
+  maxDecodeDepth?: number;
 };
 
 type MaybeAsyncIterable<T> = Iterable<T> | AsyncIterable<T>;
@@ -29,6 +34,10 @@ export function createExtendedStorage<T>(
   options: CreateExtendedStorageOptions,
 ): StorageAdapter<T> {
   const installed = installCodecs(options.codecs);
+  const maxDecodeDepth = resolveMaxDecodeDepth(
+    options.maxDecodeDepth,
+    installed.ordered.length,
+  );
   const valueCodec = new JsonValueCodec<T>();
   const storage = options.storage as StorageAdapterCapabilities;
 
@@ -46,22 +55,32 @@ export function createExtendedStorage<T>(
         return valueCodec.decode(current);
       }
 
-      if (userDecodeCount >= MAX_DECODE_DEPTH) {
-        throw new Error(
-          `Decode depth exceeded MAX_DECODE_DEPTH (${MAX_DECODE_DEPTH})`,
+      if (userDecodeCount >= maxDecodeDepth) {
+        throw new ExtendedStorageError(
+          EXTENDED_STORAGE_ERROR_CODES.DECODE_DEPTH_EXCEEDED,
+          `Decode depth exceeded maxDecodeDepth (${maxDecodeDepth})`,
         );
       }
 
       const codec = installed.byId.get(current.codec);
       if (codec === undefined) {
-        throw new Error(`Unknown storage envelope codec: ${current.codec}`);
+        throw new ExtendedStorageError(
+          EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_CODEC,
+          `Unknown storage envelope codec: ${current.codec}`,
+        );
       }
 
       const next = await codec.impl.decode(current);
       userDecodeCount++;
       if (next === undefined) {
         if (keyToDeleteOnUndefined !== undefined) {
-          await storage.delete(keyToDeleteOnUndefined);
+          try {
+            await storage.delete(keyToDeleteOnUndefined);
+          } catch {
+            // Best-effort cleanup (spec section 10.4.6): the session was
+            // already determined to be logically absent, so a failed
+            // cleanup delete must not propagate.
+          }
         }
         return undefined;
       }
@@ -201,6 +220,24 @@ export function createExtendedStorage<T>(
   return adapter;
 }
 
+function resolveMaxDecodeDepth(
+  value: number | undefined,
+  codecCount: number,
+): number {
+  if (value === undefined) {
+    return codecCount + 16;
+  }
+
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new ExtendedStorageError(
+      EXTENDED_STORAGE_ERROR_CODES.INVALID_MAX_DECODE_DEPTH,
+      `Invalid maxDecodeDepth: expected a positive integer, got ${value}`,
+    );
+  }
+
+  return value;
+}
+
 function installCodecs(
   codecs: readonly StorageEnvelopeCodec[] = [],
 ): {
@@ -214,15 +251,24 @@ function installCodecs(
     const id = impl.codec;
 
     if (id.length === 0) {
-      throw new Error("Storage envelope codec id must be non-empty");
+      throw new ExtendedStorageError(
+        EXTENDED_STORAGE_ERROR_CODES.EMPTY_CODEC_ID,
+        "Storage envelope codec id must be non-empty",
+      );
     }
 
     if (id === VALUE_CODEC_ID || id.startsWith("grammy-extended-storage-")) {
-      throw new Error(`Reserved storage envelope codec id: ${id}`);
+      throw new ExtendedStorageError(
+        EXTENDED_STORAGE_ERROR_CODES.RESERVED_CODEC_ID,
+        `Reserved storage envelope codec id: ${id}`,
+      );
     }
 
     if (byId.has(id)) {
-      throw new Error(`Duplicate storage envelope codec id: ${id}`);
+      throw new ExtendedStorageError(
+        EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_CODEC_ID,
+        `Duplicate storage envelope codec id: ${id}`,
+      );
     }
 
     const installed: InstalledEnvelopeCodec = {
@@ -251,7 +297,8 @@ function assertEncodeOutputIdentity(
   }
 
   if (mismatchedFields.length > 0) {
-    throw new Error(
+    throw new ExtendedStorageError(
+      EXTENDED_STORAGE_ERROR_CODES.CODEC_IDENTITY_MISMATCH,
       `Storage envelope codec "${codec.id}" encode output mismatched ${
         mismatchedFields.join(" and ")
       }`,
