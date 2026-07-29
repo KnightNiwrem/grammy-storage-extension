@@ -349,6 +349,30 @@ Deno.test("VAL-JSVC-007 unserializable value throws and does not write", async (
   assertEquals(await rawRead(storage, "key"), undefined);
 });
 
+Deno.test("VAL-JSVC-008 throwing JSON.stringify is translated to a typed error", async () => {
+  const storage = spyStorage(backing());
+  const adapter = createExtendedStorage<unknown>({ storage });
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+
+  for (const value of [10n, cyclic]) {
+    const error = await assertRejects(
+      async () => {
+        await adapter.write("key", value);
+      },
+      ExtendedStorageError,
+      "JSON",
+    );
+    assertEquals(
+      error.code,
+      EXTENDED_STORAGE_ERROR_CODES.VALUE_SERIALIZATION,
+    );
+    assert(error.cause instanceof TypeError);
+  }
+  assertEquals(storage.calls.writes.length, 0);
+  assertEquals(await rawRead(storage, "key"), undefined);
+});
+
 Deno.test("VAL-WRITE-001 single user codec wraps the JSON value envelope", async () => {
   const storage = backing();
   let calls = 0;

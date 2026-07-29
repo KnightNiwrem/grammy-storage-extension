@@ -22,8 +22,12 @@ export type ExtendedStorageErrorCode = (typeof EXTENDED_STORAGE_ERROR_CODES)[
 export class ExtendedStorageError extends Error {
   readonly code: ExtendedStorageErrorCode;
 
-  constructor(code: ExtendedStorageErrorCode, message: string) {
-    super(message);
+  constructor(
+    code: ExtendedStorageErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
     this.name = "ExtendedStorageError";
     this.code = code;
   }

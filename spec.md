@@ -418,7 +418,7 @@ The adapter guarantees that errors are thrown under the following circumstances.
 | **Construction** | Two codecs declare the identical identifier. | `ERR_DUPLICATE_CODEC_ID` |
 | **Construction** | A codec uses `grammy-extended-storage-value` or reserved prefixes. | `ERR_RESERVED_CODEC_ID` |
 | **Construction** | `maxDecodeDepth` is not a positive integer. | `ERR_INVALID_MAX_DECODE_DEPTH` |
-| **Runtime Write** | Output of `JSON.stringify` is invalid/undefined. | `ERR_VALUE_SERIALIZATION` |
+| **Runtime Write** | `JSON.stringify` throws or produces invalid/`undefined` output. | `ERR_VALUE_SERIALIZATION` |
 | **Runtime Write** | A codec returns an object that fails shape invariants. | `ERR_INVALID_ENVELOPE` |
 | **Runtime Write** | A codec's output `codec`/`version` doesn't match its ID. | `ERR_CODEC_IDENTITY_MISMATCH` |
 | **Runtime Read** | Database returns an object failing envelope invariants. | `ERR_INVALID_ENVELOPE` |

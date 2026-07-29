@@ -15,7 +15,16 @@ export class JsonValueCodec<T> implements StorageValueCodec<T> {
   readonly version = VALUE_CODEC_VERSION;
 
   encode(value: T): StorageEnvelope {
-    const payload = JSON.stringify(value);
+    let payload: string | undefined;
+    try {
+      payload = JSON.stringify(value);
+    } catch (error) {
+      throw new ExtendedStorageError(
+        EXTENDED_STORAGE_ERROR_CODES.VALUE_SERIALIZATION,
+        "Value cannot be encoded as a JSON storage envelope payload",
+        { cause: error },
+      );
+    }
     if (typeof payload !== "string") {
       throw new ExtendedStorageError(
         EXTENDED_STORAGE_ERROR_CODES.VALUE_SERIALIZATION,
