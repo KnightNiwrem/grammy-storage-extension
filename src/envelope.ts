@@ -1,10 +1,10 @@
 import { STORAGE_ENVELOPE_KIND } from "./constants.ts";
 
 export type StorageEnvelope = {
-  kind: typeof STORAGE_ENVELOPE_KIND;
-  codec: string;
-  version: string;
-  payload: string;
+  readonly kind: typeof STORAGE_ENVELOPE_KIND;
+  readonly codec: string;
+  readonly version: string;
+  readonly payload: string;
 };
 
 export function assertValidEnvelope(

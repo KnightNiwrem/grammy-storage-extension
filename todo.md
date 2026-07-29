@@ -3,7 +3,7 @@
 Spec changes approved in `spec.md` that the implementation in `src/` does not
 yet reflect.
 
-- [ ] **Readonly `StorageEnvelope`** (spec §3)
+- [x] **Readonly `StorageEnvelope`** (spec §3)
   - Make all fields of `StorageEnvelope` in `src/envelope.ts` `readonly` to
     match the spec's public type contract.
 
