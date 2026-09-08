@@ -167,7 +167,7 @@ Deno.test("VAL-CONSTR-005 rejects duplicate transform kinds", () => {
 Deno.test("VAL-CONSTR-006 transforms are applied to writes in declaration order", async () => {
   const storage = backing();
   const order: string[] = [];
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [
       spyTransform("first", { onEncode: () => order.push("first") }),
@@ -187,7 +187,7 @@ Deno.test("VAL-CONSTR-006 transforms are applied to writes in declaration order"
 Deno.test("VAL-CONSTR-007 mutating the transforms array after construction does not affect writes", async () => {
   const storage = backing();
   const transforms: StorageTransform[] = [spyTransform("first")];
-  const adapter = createExtendedStorage({ storage, transforms });
+  const adapter = createExtendedStorage<number>({ storage, transforms });
 
   transforms.push(spyTransform("second"));
   await adapter.write("key", 1);
@@ -332,7 +332,7 @@ Deno.test("VAL-BODY-008 value that stringifies to undefined throws a typed error
 
 Deno.test("VAL-BODY-009 base64 body with zero transforms is decoded by its encoding field", async () => {
   const storage = backing();
-  const adapter = createExtendedStorage({ storage });
+  const adapter = createExtendedStorage<number[]>({ storage });
   await storage.write(
     "key",
     validEnvelope({ encoding: "base64", body: base64(utf8.encode("[1,2]")) }),
@@ -361,7 +361,7 @@ Deno.test("VAL-BODY-010 invalid base64 body throws the native decoding error", a
 
 Deno.test("VAL-WRITE-001 single transform records its identity, normalises meta, and base64-encodes the body", async () => {
   const storage = backing();
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<{ a: number }>({
     storage,
     transforms: [spyTransform("rev", { version: "2.1.0", reverse: true })],
   });
@@ -380,7 +380,7 @@ Deno.test("VAL-WRITE-001 single transform records its identity, normalises meta,
 Deno.test("VAL-WRITE-002 multiple transforms compose in declaration order", async () => {
   const storage = backing();
   const seen: Record<string, Uint8Array> = {};
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<string>({
     storage,
     transforms: [
       spyTransform("rev", { reverse: true, onEncode: (b) => seen.rev = b }),
@@ -401,7 +401,7 @@ Deno.test("VAL-WRITE-002 multiple transforms compose in declaration order", asyn
 
 Deno.test("VAL-WRITE-003 meta returned by encode is recorded on the transform entry", async () => {
   const storage = backing();
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [spyTransform("tagged", { meta: { tag: "x", n: 2 } })],
   });
@@ -427,7 +427,7 @@ Deno.test("VAL-WRITE-004 invalid encode output throws before any storage mutatio
 
   for (const output of outputs) {
     const storage = spyStorage(backing());
-    const adapter = createExtendedStorage({
+    const adapter = createExtendedStorage<number>({
       storage,
       transforms: [{
         kind: "bad",
@@ -455,7 +455,7 @@ Deno.test("VAL-WRITE-004 invalid encode output throws before any storage mutatio
 Deno.test("VAL-WRITE-005 async encode is supported and applied sequentially", async () => {
   const storage = backing();
   const order: string[] = [];
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<string>({
     storage,
     transforms: [
       spyTransform("a", {
@@ -475,7 +475,7 @@ Deno.test("VAL-WRITE-005 async encode is supported and applied sequentially", as
 
 Deno.test("VAL-WRITE-006 write delegates exactly once to backing storage", async () => {
   const storage = spyStorage(backing());
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [spyTransform("a"), spyTransform("b")],
   });
@@ -488,7 +488,7 @@ Deno.test("VAL-WRITE-006 write delegates exactly once to backing storage", async
 
 Deno.test("VAL-WRITE-007 a transform failing mid-chain prevents any write", async () => {
   const storage = spyStorage(backing());
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [
       spyTransform("ok"),
@@ -531,7 +531,7 @@ Deno.test("VAL-READ-001 returns undefined for a missing backing entry without de
 Deno.test("VAL-READ-002 decode walks the recorded transforms in reverse order", async () => {
   const storage = backing();
   const order: string[] = [];
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [
       spyTransform("a", { onDecode: () => order.push("a") }),
@@ -549,8 +549,14 @@ Deno.test("VAL-READ-003 read order follows the record, not declaration order", a
   const storage = backing();
   const a = spyTransform("a", { reverse: true });
   const b = spyTransform("b");
-  const writer = createExtendedStorage({ storage, transforms: [a, b] });
-  const reader = createExtendedStorage({ storage, transforms: [b, a] });
+  const writer = createExtendedStorage<{ swapped: boolean }>({
+    storage,
+    transforms: [a, b],
+  });
+  const reader = createExtendedStorage<{ swapped: boolean }>({
+    storage,
+    transforms: [b, a],
+  });
 
   await writer.write("key", { swapped: true });
 
@@ -593,7 +599,7 @@ Deno.test("VAL-READ-005 malformed backing envelope throws", async () => {
 Deno.test("VAL-READ-006 decode returning a non-Uint8Array throws", async () => {
   for (const output of [undefined, null, "text", [1], new ArrayBuffer(2)]) {
     const storage = spyStorage(backing());
-    const adapter = createExtendedStorage({
+    const adapter = createExtendedStorage<number>({
       storage,
       transforms: [{
         kind: "bad",
@@ -621,7 +627,7 @@ Deno.test("VAL-READ-006 decode returning a non-Uint8Array throws", async () => {
 });
 
 Deno.test("VAL-READ-007 async decode is supported", async () => {
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number[]>({
     storage: backing(),
     transforms: [spyTransform("a", { decodeAsync: true, reverse: true })],
   });
@@ -632,7 +638,7 @@ Deno.test("VAL-READ-007 async decode is supported", async () => {
 
 Deno.test("VAL-READ-008 errors thrown by decode propagate without deleting", async () => {
   const storage = spyStorage(backing());
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [{
       kind: "boom",
@@ -660,7 +666,7 @@ Deno.test("VAL-READ-008 errors thrown by decode propagate without deleting", asy
 Deno.test("VAL-READ-009 decode receives the stored record, including historical version and meta", async () => {
   const storage = backing();
   let received: StorageTransformRecord | undefined;
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [
       spyTransform("a", { version: "2.0.0", onDecode: (_, r) => received = r }),
@@ -689,7 +695,10 @@ Deno.test("VAL-READ-009 decode receives the stored record, including historical 
 Deno.test("VAL-EXPIRE-001 expired entry reads as undefined, is deleted once, and is never decoded", async () => {
   const storage = spyStorage(backing());
   const transform = spyTransform("ttl", { expired: true });
-  const adapter = createExtendedStorage({ storage, transforms: [transform] });
+  const adapter = createExtendedStorage<number>({
+    storage,
+    transforms: [transform],
+  });
   await adapter.write("key", 1);
   storage.calls.deletes.length = 0;
 
@@ -704,7 +713,7 @@ Deno.test("VAL-EXPIRE-001 expired entry reads as undefined, is deleted once, and
 Deno.test("VAL-EXPIRE-002 isExpired receives its own record with meta", async () => {
   const storage = backing();
   let received: StorageTransformRecord | undefined;
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [
       spyTransform("other", { meta: { other: true } }),
@@ -742,7 +751,7 @@ Deno.test("VAL-EXPIRE-003 checks run in recorded order and short-circuit on the 
       return false;
     },
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [first, second],
   });
@@ -755,7 +764,7 @@ Deno.test("VAL-EXPIRE-003 checks run in recorded order and short-circuit on the 
 
 Deno.test("VAL-EXPIRE-004 any transform reporting expiry wins", async () => {
   const storage = backing();
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [
       spyTransform("alive", { expired: false }),
@@ -771,7 +780,7 @@ Deno.test("VAL-EXPIRE-004 any transform reporting expiry wins", async () => {
 
 Deno.test("VAL-EXPIRE-005 a throwing isExpired propagates and does not delete", async () => {
   const storage = spyStorage(backing());
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [
       spyTransform("boom", {
@@ -798,7 +807,7 @@ Deno.test("VAL-EXPIRE-006 transforms without isExpired are skipped and live entr
   const storage = spyStorage(backing());
   const plain = spyTransform("plain", { reverse: true });
   const alive = spyTransform("alive", { expired: false });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<{ live: boolean }>({
     storage,
     transforms: [plain, alive],
   });
@@ -813,7 +822,7 @@ Deno.test("VAL-EXPIRE-006 transforms without isExpired are skipped and live entr
 
 Deno.test("VAL-EXPIRE-007 cleanup delete failure does not propagate", async () => {
   const storage = backing();
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [spyTransform("ttl", { expired: true })],
   });
@@ -827,7 +836,7 @@ Deno.test("VAL-EXPIRE-007 cleanup delete failure does not propagate", async () =
 
 Deno.test("VAL-EXPIRE-008 async isExpired is supported", async () => {
   const storage = backing();
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [{
       kind: "ttl",
@@ -910,7 +919,7 @@ Deno.test("VAL-RO-002 a kind registered in both lists is rejected as a duplicate
 Deno.test("VAL-RO-003 read-only transforms are never applied on write", async () => {
   const storage = backing();
   const full = spyTransform("full", { expired: false });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [spyTransform("active")],
     readOnlyTransforms: [readOnlySpy("legacy"), full],
@@ -929,7 +938,7 @@ Deno.test("VAL-RO-004 rows produced by a retired transform stay readable and are
   const storage = backing();
   const keep = spyTransform("keep");
   const retired = spyTransform("retired", { reverse: true, meta: { v: 1 } });
-  const oldAdapter = createExtendedStorage({
+  const oldAdapter = createExtendedStorage<{ migrated: boolean }>({
     storage,
     transforms: [keep, retired],
   });
@@ -940,7 +949,7 @@ Deno.test("VAL-RO-004 rows produced by a retired transform stay readable and are
     reverse: true,
     onDecode: (_, r) => seen = r,
   });
-  const newAdapter = createExtendedStorage({
+  const newAdapter = createExtendedStorage<{ migrated: boolean }>({
     storage,
     transforms: [keep],
     readOnlyTransforms: [legacy],
@@ -956,13 +965,16 @@ Deno.test("VAL-RO-004 rows produced by a retired transform stay readable and are
     ["keep"],
   );
 
-  const finalAdapter = createExtendedStorage({ storage, transforms: [keep] });
+  const finalAdapter = createExtendedStorage<{ migrated: boolean }>({
+    storage,
+    transforms: [keep],
+  });
   assertEquals(await finalAdapter.read("key"), { migrated: true });
 });
 
 Deno.test("VAL-RO-005 isExpired on a read-only transform expires the row for read and has", async () => {
   const storage = spyStorage(backing());
-  const writer = createExtendedStorage({
+  const writer = createExtendedStorage<number>({
     storage,
     transforms: [spyTransform("ttl", { meta: { dead: true } })],
   });
@@ -971,7 +983,7 @@ Deno.test("VAL-RO-005 isExpired on a read-only transform expires the row for rea
   storage.calls.deletes.length = 0;
 
   const legacy = readOnlySpy("ttl", { expired: (r) => r.meta.dead === true });
-  const reader = createExtendedStorage({
+  const reader = createExtendedStorage<number>({
     storage,
     readOnlyTransforms: [legacy],
   });
@@ -989,7 +1001,10 @@ Deno.test("VAL-RO-005 isExpired on a read-only transform expires the row for rea
 Deno.test("VAL-DEL-001 delete delegates directly to backing storage without transforms", async () => {
   const storage = spyStorage(backing());
   const transform = spyTransform("a", { expired: false });
-  const adapter = createExtendedStorage({ storage, transforms: [transform] });
+  const adapter = createExtendedStorage<number>({
+    storage,
+    transforms: [transform],
+  });
   await adapter.write("key", 1);
 
   await adapter.delete("key");
@@ -1147,8 +1162,14 @@ Deno.test("VAL-CROSS-002 adding an unused transform does not break reads of pre-
   const storage = backing();
   const a = spyTransform("a", { reverse: true });
   const b = spyTransform("b", { expired: true });
-  const writer = createExtendedStorage({ storage, transforms: [a] });
-  const reader = createExtendedStorage({ storage, transforms: [a, b] });
+  const writer = createExtendedStorage<{ persisted: boolean }>({
+    storage,
+    transforms: [a],
+  });
+  const reader = createExtendedStorage<{ persisted: boolean }>({
+    storage,
+    transforms: [a, b],
+  });
 
   await writer.write("key", { persisted: true });
 
@@ -1160,8 +1181,14 @@ Deno.test("VAL-CROSS-003 read fails informatively when a required transform is m
   const storage = backing();
   const a = spyTransform("a");
   const b = spyTransform("b");
-  const writer = createExtendedStorage({ storage, transforms: [a, b] });
-  const reader = createExtendedStorage({ storage, transforms: [a] });
+  const writer = createExtendedStorage<{ persisted: boolean }>({
+    storage,
+    transforms: [a, b],
+  });
+  const reader = createExtendedStorage<{ persisted: boolean }>({
+    storage,
+    transforms: [a],
+  });
 
   await writer.write("key", { persisted: true });
 
@@ -1192,7 +1219,10 @@ Deno.test("VAL-CROSS-004 mixed sync and async transforms roundtrip", async () =>
       ],
     ]
   ) {
-    const adapter = createExtendedStorage({ storage: backing(), transforms });
+    const adapter = createExtendedStorage<{ mixed: boolean }>({
+      storage: backing(),
+      transforms,
+    });
 
     await adapter.write("key", { mixed: true });
 
