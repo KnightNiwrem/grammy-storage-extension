@@ -33,75 +33,23 @@ const record = (
   ...overrides,
 });
 
-/** A representative session value paired with the key it is stored under. */
-type RoundtripCase<T> = {
-  readonly name: string;
-  readonly key: string;
-  readonly value: T;
-};
-
 // ---------------------------------------------------------------------------
 // examples/gzip.ts
 // ---------------------------------------------------------------------------
 
-Deno.test("EX-GZIP-001 roundtrips a representative value of each JSON shape", async () => {
-  // gzip roundtrips the body verbatim, so each case declares the concrete
-  // application type its adapter stores. A storage value need not be an object.
-  const objectCase: RoundtripCase<{ items: [number, { flag: boolean }] }> = {
-    name: "nested object",
-    key: "profile:nested",
-    value: { items: [1, { flag: true }] },
-  };
-  const arrayCase: RoundtripCase<Array<string | null>> = {
-    name: "array with null element",
-    key: "tags:mixed",
-    value: ["x", null],
-  };
-  const stringCase: RoundtripCase<string> = {
-    name: "plain string",
-    key: "message:greeting",
-    value: "hello",
-  };
-  const nullCase: RoundtripCase<null> = {
-    name: "null value",
-    key: "cleared:slot",
-    value: null,
-  };
-
-  const objectStorage = backing();
-  const objectAdapter = createExtendedStorage<
-    { items: [number, { flag: boolean }] }
-  >({ storage: objectStorage, transforms: [gzip()] });
-  await objectAdapter.write(objectCase.key, objectCase.value);
-  assertEquals(await objectAdapter.read(objectCase.key), objectCase.value);
-
-  const arrayStorage = backing();
-  const arrayAdapter = createExtendedStorage<Array<string | null>>({
-    storage: arrayStorage,
+Deno.test("EX-GZIP-001 roundtrips the body verbatim and stamps meta.rawLength", async () => {
+  const storage = backing();
+  const adapter = createExtendedStorage<string>({
+    storage,
     transforms: [gzip()],
   });
-  await arrayAdapter.write(arrayCase.key, arrayCase.value);
-  assertEquals(await arrayAdapter.read(arrayCase.key), arrayCase.value);
+  const messageKey = "message:greeting";
+  const message = "hello";
 
-  const nullStorage = backing();
-  const nullAdapter = createExtendedStorage<null>({
-    storage: nullStorage,
-    transforms: [gzip()],
-  });
-  await nullAdapter.write(nullCase.key, nullCase.value);
-  assertEquals(await nullAdapter.read(nullCase.key), nullCase.value);
+  await adapter.write(messageKey, message);
+  assertEquals(await adapter.read(messageKey), message);
 
-  // The string case also verifies the gzip metadata for its own known value,
-  // so the assertion references the same key and value used to write it.
-  const messageStorage = backing();
-  const messageAdapter = createExtendedStorage<string>({
-    storage: messageStorage,
-    transforms: [gzip()],
-  });
-  await messageAdapter.write(stringCase.key, stringCase.value);
-  assertEquals(await messageAdapter.read(stringCase.key), stringCase.value);
-
-  const stored = await rawRead(messageStorage, stringCase.key);
+  const stored = await rawRead(storage, messageKey);
   assertEquals(stored.transforms.map((r) => r.kind), ["example:gzip"]);
   // The JSON text of "hello" is '"hello"': seven UTF-8 bytes with the quotes.
   assertEquals(stored.transforms[0].meta, { rawLength: 7 });

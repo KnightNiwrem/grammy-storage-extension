@@ -112,7 +112,10 @@ Deno.test("VAL-CONSTR-001 returns a usable StorageAdapter<T> with no transforms"
 });
 
 Deno.test("VAL-CONSTR-002 accepts an empty transforms array", async () => {
-  const adapter = createExtendedStorage({ storage: backing(), transforms: [] });
+  const adapter = createExtendedStorage<number>({
+    storage: backing(),
+    transforms: [],
+  });
   await adapter.write("key", 1);
   assertEquals(await adapter.read("key"), 1);
 });
@@ -296,9 +299,9 @@ Deno.test("VAL-BODY-006 invalid UTF-8 body throws the native decoding error", as
 
 Deno.test("VAL-BODY-007 unserializable value throws and does not write", async () => {
   const storage = spyStorage(backing());
-  // Escape hatch: this boundary test feeds a value no valid session type could
-  // hold (a bigint is not JSON-serializable), so `unknown` is required here.
-  const adapter = createExtendedStorage<unknown>({ storage });
+  // A bigint has no JSON representation: JSON.stringify throws on it, so the
+  // write must surface VALUE_SERIALIZATION and store nothing.
+  const adapter = createExtendedStorage<{ big: bigint }>({ storage });
 
   const error = await assertRejects(
     async () => {
@@ -313,9 +316,9 @@ Deno.test("VAL-BODY-007 unserializable value throws and does not write", async (
 
 Deno.test("VAL-BODY-008 value that stringifies to undefined throws a typed error", async () => {
   const storage = spyStorage(backing());
-  // Escape hatch: a function is not a valid session value, but the write path
-  // must still reject it, so this boundary test types the value as `unknown`.
-  const adapter = createExtendedStorage<unknown>({ storage });
+  // A function stringifies to `undefined` rather than JSON, which the write
+  // path must reject as VALUE_SERIALIZATION instead of storing a row.
+  const adapter = createExtendedStorage<() => number>({ storage });
 
   const error = await assertRejects(
     async () => {

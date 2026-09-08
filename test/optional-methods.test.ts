@@ -35,6 +35,14 @@ function setMethods(
   return storage;
 }
 
+/**
+ * The application value the optional-method fixtures store. Two intentionally
+ * different live shapes prove the machinery is agnostic to the application
+ * value; naming the union lets the writer and every reader share one contract
+ * instead of each erasing it to `unknown`.
+ */
+type FixtureValue = { value: number } | string[];
+
 /** Transforms shared by every fixture: a body-changing one and an expiry one. */
 function fixtureTransforms(): { rev: SpyTransform; ttl: SpyTransform } {
   return {
@@ -57,10 +65,7 @@ async function writeOptionalFixtures(
   keys: string[];
   values: StorageEnvelope[];
 }> {
-  // Two intentionally different live shapes prove the optional-method
-  // machinery is agnostic to the application value; the union names that
-  // domain explicitly instead of erasing it to `unknown`.
-  const writer = createExtendedStorage<{ value: number } | string[]>({
+  const writer = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -117,7 +122,7 @@ Deno.test("VAL-OPT-001 has reports live entries without decoding the body", asyn
   const transforms = fixtureTransforms();
   await writeOptionalFixtures(storage, transforms);
   transforms.rev.calls.decode = 0;
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -131,7 +136,7 @@ Deno.test("VAL-OPT-002 has reports expired entries as absent and cleans them up"
   const storage = backing();
   const transforms = fixtureTransforms();
   await writeOptionalFixtures(storage, transforms);
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -152,7 +157,7 @@ Deno.test("VAL-OPT-003 has does not forward to the backing has", async () => {
       return true;
     },
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -165,7 +170,7 @@ Deno.test("VAL-OPT-003 has does not forward to the backing has", async () => {
 Deno.test("VAL-OPT-004 has is exposed when the backing adapter does not expose has", async () => {
   const storage = backing();
   setMethods(storage, { has: undefined });
-  const adapter = createExtendedStorage({ storage });
+  const adapter = createExtendedStorage<number>({ storage });
   await adapter.write("a", 1);
 
   assertEquals(typeof adapter.has, "function");
@@ -185,7 +190,7 @@ Deno.test("VAL-OPT-005 readAllKeys from entries yields live keys without decodin
     readAllValues: undefined,
     readAllEntries: () => fixtures.entries,
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -204,7 +209,7 @@ Deno.test("VAL-OPT-006 readAllKeys from keys uses has per key", async () => {
     readAllValues: undefined,
     readAllEntries: undefined,
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -237,7 +242,7 @@ Deno.test("VAL-OPT-008 readAllValues from entries yields decoded live values and
     readAllValues: undefined,
     readAllEntries: () => fixtures.entries,
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -258,7 +263,7 @@ Deno.test("VAL-OPT-009 readAllValues from values filters expired entries but can
     readAllValues: () => fixtures.values,
     readAllEntries: undefined,
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -279,7 +284,7 @@ Deno.test("VAL-OPT-010 readAllValues from keys reads each key and cleans up expi
     readAllValues: undefined,
     readAllEntries: undefined,
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -320,7 +325,7 @@ Deno.test("VAL-OPT-010c readAllValues prefers backing readAllValues over keys", 
     },
     readAllEntries: undefined,
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -343,7 +348,7 @@ Deno.test("VAL-OPT-011 readAllEntries from entries yields decoded live pairs and
     readAllValues: undefined,
     readAllEntries: () => fixtures.entries,
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -364,7 +369,7 @@ Deno.test("VAL-OPT-012 readAllEntries from keys reads each key", async () => {
     readAllValues: undefined,
     readAllEntries: undefined,
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -401,7 +406,7 @@ Deno.test("VAL-OPT-014 bulk methods are async-iterable when backing iterables ar
     readAllValues: () => fixtures.values,
     readAllEntries: () => fixtures.entries,
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -438,7 +443,7 @@ Deno.test("VAL-OPT-015 bulk methods prefer readAllEntries when backing exposes a
       return fixtures.entries;
     },
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -460,7 +465,7 @@ Deno.test("VAL-OPT-016 bulk iteration ignores cleanup delete failures", async ()
       throw new Error("delete failed");
     },
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
@@ -480,7 +485,7 @@ Deno.test("VAL-OPT-017 bulk iteration is fail-fast on a corrupt entry", async ()
   setMethods(storage, {
     readAllEntries: () => [fixtures.entries[0], ["bad", corrupt]],
   });
-  const adapter = createExtendedStorage({
+  const adapter = createExtendedStorage<FixtureValue>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });
