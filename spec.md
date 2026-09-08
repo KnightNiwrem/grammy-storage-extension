@@ -6,76 +6,65 @@ An advanced, middleware-like session storage wrapper for the [grammY bot framewo
 
 ## 1. Overview & Architecture
 
-`@grammyjs/storage-extended` provides a layered session storage adapter (`StorageAdapter<T>`) built on top of an underlying raw storage engine (`StorageAdapter<StorageEnvelope>`). 
+`@grammyjs/storage-extended` provides a layered session storage adapter (`StorageAdapter<T>`) built on top of an underlying raw storage engine (`StorageAdapter<StorageEnvelope>`).
 
-Instead of storing raw, unstructured session objects directly in the database, this extension encapsulates the session state inside a structured metadata envelope (`StorageEnvelope`). The adapter then runs a pipeline of **Envelope Codecs** that recursively serialize, encrypt, compress, or sign the data as it flows into and out of storage.
+Instead of storing raw session objects directly in the database, this extension stores each session inside a structured `StorageEnvelope`: a single serialized **body** plus an ordered list of **transform records** describing how that body was produced. A pipeline of user-supplied **Transforms** (compression, encryption, expiry tracking, …) operates on the body bytes as they flow into and out of storage. Each transform may attach plaintext **meta** to its record, and may expose a cheap **expiry check** that runs on the record alone, without touching the body.
 
-### 1.1 Serialization (Write) Pipeline
+### 1.1 Write Pipeline
 
-When writing data, the session state is first serialized into a JSON envelope. Then, user-defined codecs are applied sequentially in the **order of their declaration** (from first to last):
+The session state is serialized to JSON, converted to bytes, and passed through the transforms **in declaration order**. Each transform's output body feeds the next, and each transform's record is appended to the envelope's `transforms` list:
 
 ```
 Raw Session State (T)
          │
+         ▼   JSON.stringify → UTF-8 bytes
+ ┌───────────────┐
+ │  Transform A  │  <-- e.g. gzip: body ← compressed, record {kind:"gzip", meta:{…}}
+ └───────────────┘
+         │
          ▼
  ┌───────────────┐
- │  Value Codec  │  <-- Encodes session state (T) into initial JSON payload
+ │  Transform B  │  <-- e.g. ttl: body unchanged, record {kind:"ttl", meta:{expiresAt}}
  └───────────────┘
          │
-         ▼   [Core Envelope]
+         ▼   base64
  ┌───────────────┐
- │    Codec A    │  <-- First user-supplied layer (e.g. Compression)
- └───────────────┘
-         │
-         ▼   [Compressed Envelope]
- ┌───────────────┐
- │    Codec B    │  <-- Second user-supplied layer (e.g. Encryption)
- └───────────────┘
-         │
-         ▼   [Compressed & Encrypted Envelope]
- ┌───────────────┐
- │  Raw Storage  │  <-- Outermost envelope written to backing database
+ │  Raw Storage  │  <-- { transforms: [A, B], encoding: "base64", body }
  └───────────────┘
 ```
 
-### 1.2 Deserialization (Read) Pipeline
+### 1.2 Read Pipeline
 
-Unlike the write pipeline, reading is **data-driven**, not order-driven. The adapter inspects the `codec` identifier of the envelope retrieved from storage, locates the matching codec, and decodes it. This process repeats recursively until it reaches the core JSON Value Codec:
+Reading is **record-driven**: the adapter walks the envelope's stored `transforms` list, not the configured list. It runs in two passes:
+
+1. **Expiry pass** (cheap): every recorded transform that exposes `isExpired` is asked, in recorded order, whether its record marks the entry as expired. If any says yes, the entry is deleted and treated as absent. The body is never touched.
+2. **Body pass** (expensive): only if the entry is live, the body is decoded and the transforms are undone **in reverse recorded order**, then the resulting UTF-8 JSON is parsed.
 
 ```
                   ┌───────────────┐
-                  │  Raw Storage  │  <-- Reads outermost envelope
+                  │  Raw Storage  │
                   └───────────────┘
                           │
-                          ▼   [Enveloped Data]
+                          ▼   assertValidEnvelope
                   ┌───────────────┐
-                  │  Route Codec  │  <-- Inspects `envelope.codec`
+                  │  Expiry pass  │  <-- A.isExpired?(recA), B.isExpired?(recB) …
                   └───────────────┘
-                          │
             ┌─────────────┴─────────────┐
-            ▼ (codec === "aes-gcm")     ▼ (codec === "value")
-    ┌───────────────┐           ┌───────────────┐
-    │    Codec B    │           │  Value Codec  │
-    └───────────────┘           └───────────────┘
-            │                           │
-            ▼ [Compressed Envelope]     ▼
-    ┌───────────────┐           ┌───────────────┐
-    │    Route      │           │ Return state T│
-    └───────────────┘           └───────────────┘
-            │
-            ▼ (codec === "gzip")
-    ┌───────────────┐
-    │    Codec A    │
-    └───────────────┘
-            │
-            ▼ [Core Envelope]
-    ┌───────────────┐
-    │  Value Codec  │
-    └───────────────┘
-            │
-            ▼
-     Return state T
+            ▼ (any true)                ▼ (none true)
+   [storage.delete(key)]        ┌───────────────┐
+   return undefined             │  Transform B  │  <-- decode(body, recB)
+                                └───────────────┘
+                                        │
+                                        ▼
+                                ┌───────────────┐
+                                │  Transform A  │  <-- decode(body, recA)
+                                └───────────────┘
+                                        │
+                                        ▼   UTF-8 → JSON.parse
+                                 Return state T
 ```
+
+`has(key)` and `readAllKeys()` stop after the expiry pass, so they never pay for decompression or decryption.
 
 > [!IMPORTANT]
 > **No Legacy Compatibility**: This specification does **not** provide fallback parsing for raw, unwrapped legacy database entries. Any pre-existing database contents must be migrated to `StorageEnvelope` format before activating this adapter.
@@ -88,10 +77,11 @@ Unlike the write pipeline, reading is **data-driven**, not order-driven. The ada
 | :--- | :--- |
 | **Layered Adapter** | The `StorageAdapter<T>` returned by `createExtendedStorage` that wraps the underlying storage. |
 | **Underlying Storage** | The physical database adapter (e.g., Redis, MongoDB, Memory) that reads and writes `StorageEnvelope` objects. |
-| **Storage Envelope** | The standardized JSON transport object (`StorageEnvelope`) stored in the underlying database. |
-| **Value Codec** | The mandatory, internal serializer that converts the rich session state `T` to/from the core `StorageEnvelope`. |
-| **Envelope Codec** | A middleware-like plugin (`StorageEnvelopeCodec`) that takes a `StorageEnvelope` and encodes its payload into another outer `StorageEnvelope`. |
-| **Implicit Deletion (Tombstoning)** | A design pattern where a codec's `decode` returns `undefined` (indicating the session has expired or failed validation), triggering automatic removal of that key from storage. |
+| **Storage Envelope** | The standardized JSON transport object stored in the underlying database: a body string, its encoding, and the ordered transform records. |
+| **Body** | The session state as bytes: UTF-8 JSON before any transform, arbitrary bytes after. |
+| **Transform** | A plugin (`StorageTransform`) that rewrites the body bytes on write and restores them on read, optionally attaching meta and an expiry check. |
+| **Transform Record** | The `{ kind, version, meta }` entry the adapter appends to the envelope for each applied transform. |
+| **Expiry (Implicit Deletion)** | A transform's `isExpired(record)` returning `true`, which makes the adapter delete the entry and treat it as absent without decoding the body. |
 
 ---
 
@@ -102,36 +92,68 @@ import type { StorageAdapter } from "grammy";
 
 export type MaybePromise<T> = T | Promise<T>;
 
+/** How the envelope `body` string encodes the underlying bytes. */
+export type StorageBodyEncoding = "utf8" | "base64";
+
+/** One entry in the ordered list of transforms applied to an envelope body. */
+export type StorageTransformRecord = {
+  readonly kind: string;
+  readonly version: string;
+  readonly meta: Readonly<Record<string, unknown>>;
+};
+
 /**
  * The standardized container stored physically in the database.
  */
 export type StorageEnvelope = {
   readonly kind: typeof STORAGE_ENVELOPE_KIND;
-  readonly codec: string;
+  /** The package version that wrote this envelope (see §4). */
   readonly version: string;
-  readonly payload: string;
+  /** Records of the transforms applied, in application order. */
+  readonly transforms: readonly StorageTransformRecord[];
+  readonly encoding: StorageBodyEncoding;
+  readonly body: string;
+};
+
+/** The result of a transform's `encode` step. */
+export type StorageTransformOutput = {
+  readonly body: Uint8Array;
+  /** Plaintext, JSON-serializable metadata. Defaults to `{}`. */
+  readonly meta?: Record<string, unknown>;
 };
 
 /**
- * Interface implemented by custom codec plugins (e.g., encryption, compression).
+ * The read-side half of a transform: enough to decode and expire records of its kind.
+ * Register one via `readOnlyTransforms` to keep reading rows produced by a
+ * transform that is no longer applied on write (see §7.6).
  */
-export interface StorageEnvelopeCodec {
-  /** A unique identifier representing this codec family (e.g., "aes-gcm"). */
-  readonly codec: string;
+export interface StorageReadOnlyTransform {
+  /** A unique identifier representing this transform family (e.g., "aes-gcm"). */
+  readonly kind: string;
 
-  /** The current version of the write format produced by this codec (e.g., "1.0.0"). */
-  readonly version: string;
-
-  /** Wraps an inner envelope into an outer envelope. */
-  encode(envelope: StorageEnvelope): MaybePromise<StorageEnvelope>;
+  /** Restores the body bytes on read, given the record written for this transform. */
+  decode(
+    body: Uint8Array,
+    record: StorageTransformRecord,
+  ): MaybePromise<Uint8Array>;
 
   /**
-   * Unwraps an outer envelope back into its inner envelope.
-   * Returns `undefined` if the envelope represents a tombstoned or expired session.
+   * Cheap expiry check based solely on the recorded metadata.
+   * Returning `true` marks the whole entry as expired.
    */
-  decode(
-    envelope: StorageEnvelope,
-  ): MaybePromise<StorageEnvelope | undefined>;
+  isExpired?(record: StorageTransformRecord): MaybePromise<boolean>;
+}
+
+/**
+ * Interface implemented by transform plugins (e.g., encryption, compression, expiry),
+ * applied on write and undone on read.
+ */
+export interface StorageTransform extends StorageReadOnlyTransform {
+  /** The current version of the format produced by `encode` (e.g., "1.0.0"). */
+  readonly version: string;
+
+  /** Rewrites the body bytes on write and optionally attaches meta. */
+  encode(body: Uint8Array): MaybePromise<StorageTransformOutput>;
 }
 
 /**
@@ -143,7 +165,7 @@ export function assertValidEnvelope(
 
 /**
  * Base class for all errors raised by the adapter itself.
- * Errors thrown by custom codecs or by `JSON.parse` propagate unchanged.
+ * Errors thrown by transforms, by base64 decoding, by UTF-8 decoding, or by `JSON.parse` propagate unchanged.
  */
 export class ExtendedStorageError extends Error {
   readonly code: ExtendedStorageErrorCode;
@@ -153,30 +175,24 @@ export type ExtendedStorageErrorCode =
   (typeof EXTENDED_STORAGE_ERROR_CODES)[keyof typeof EXTENDED_STORAGE_ERROR_CODES];
 
 export const EXTENDED_STORAGE_ERROR_CODES = {
-  EMPTY_CODEC_ID: "ERR_EMPTY_CODEC_ID",
-  RESERVED_CODEC_ID: "ERR_RESERVED_CODEC_ID",
-  DUPLICATE_CODEC_ID: "ERR_DUPLICATE_CODEC_ID",
-  INVALID_MAX_DECODE_DEPTH: "ERR_INVALID_MAX_DECODE_DEPTH",
+  EMPTY_TRANSFORM_KIND: "ERR_EMPTY_TRANSFORM_KIND",
+  RESERVED_TRANSFORM_KIND: "ERR_RESERVED_TRANSFORM_KIND",
+  DUPLICATE_TRANSFORM_KIND: "ERR_DUPLICATE_TRANSFORM_KIND",
   VALUE_SERIALIZATION: "ERR_VALUE_SERIALIZATION",
   INVALID_ENVELOPE: "ERR_INVALID_ENVELOPE",
-  CODEC_IDENTITY_MISMATCH: "ERR_CODEC_IDENTITY_MISMATCH",
-  UNSUPPORTED_VALUE_VERSION: "ERR_UNSUPPORTED_VALUE_VERSION",
-  UNKNOWN_CODEC: "ERR_UNKNOWN_CODEC",
-  DECODE_DEPTH_EXCEEDED: "ERR_DECODE_DEPTH_EXCEEDED",
+  INVALID_TRANSFORM_OUTPUT: "ERR_INVALID_TRANSFORM_OUTPUT",
+  UNKNOWN_TRANSFORM: "ERR_UNKNOWN_TRANSFORM",
 } as const;
 
 export type CreateExtendedStorageOptions = {
   /** The physical database adapter to read/write envelopes. */
   storage: StorageAdapter<StorageEnvelope>;
-  
-  /** Optional ordered array of envelope wrapping layers. */
-  codecs?: readonly StorageEnvelopeCodec[];
 
-  /**
-   * Optional upper bound on how many custom-codec decode steps a single
-   * read may perform. Defaults to `codecs.length + 16`.
-   */
-  maxDecodeDepth?: number;
+  /** Optional ordered array of body transforms applied on write. */
+  transforms?: readonly StorageTransform[];
+
+  /** Optional transforms registered only for reading; never applied on write. */
+  readOnlyTransforms?: readonly StorageReadOnlyTransform[];
 };
 
 export function createExtendedStorage<T>(
@@ -185,63 +201,51 @@ export function createExtendedStorage<T>(
 ```
 
 ### 3.1 Serialization Constraints
-The JSON Value Codec is internal and mandatory. Custom serialization algorithms (e.g. MessagePack) are not supported at the value-codec level unless the public factory API is extended to expose value-codec customization. The `StorageValueCodec<T>` interface that the JSON Value Codec implements is an internal detail of the adapter and is not part of the public API.
+Body serialization is internal and mandatory: the body is always `JSON.stringify(value)` encoded as UTF-8 before the first transform. Custom value serializers (e.g. MessagePack) are not supported unless the public factory API is extended to expose them.
 
 ---
 
 ## 4. Spec Constants & Reserved Identifiers
 
-The following identifier constants are reserved by the implementation:
+The following constants are exported by the implementation:
 
 ```typescript
 export const STORAGE_ENVELOPE_KIND = "grammy-extended-storage-envelope" as const;
-export const VALUE_CODEC_ID = "grammy-extended-storage-value" as const;
-export const VALUE_CODEC_VERSION = "1.0.0" as const;
-export const MAX_DECODE_DEPTH = 100 as const;
+export const RESERVED_TRANSFORM_KIND_PREFIX = "grammy-extended-storage-" as const;
+export const PACKAGE_VERSION = "<version from deno.json>" as const;
 ```
 
-> [!NOTE]
-> `MAX_DECODE_DEPTH` is retained for backward compatibility but no longer
-> determines the default read depth limit. The effective limit is resolved at
-> construction time (see §8).
+`PACKAGE_VERSION` MUST equal the `version` field in `deno.json`; the test suite enforces this. Every envelope written carries it in `version`, so an envelope found in the database identifies the exact release that produced it. The adapter does not currently gate reads on `version`; future releases that change the format may branch on it.
 
-### 4.1 Custom Codec Constraints
-User-supplied `StorageEnvelopeCodec` objects must adhere to the following naming rules:
-1. **No Empty Identifiers**: The `codec` string cannot be empty.
-2. **No Reserved Namespace Collisions**: The `codec` string cannot begin with `grammy-extended-storage-`. This also covers `VALUE_CODEC_ID` itself, which shares that prefix.
+### 4.1 Transform Kind Constraints
+User-supplied `StorageTransform` objects must adhere to the following naming rules:
+1. **No Empty Identifiers**: The `kind` string cannot be empty.
+2. **No Reserved Namespace Collisions**: The `kind` string cannot begin with `RESERVED_TRANSFORM_KIND_PREFIX`.
 
 > [!TIP]
-> Custom codec identifiers should be globally namespaced to prevent collisions (e.g. `npm:@my-org/codec-aes-gcm` or `jsr:@my-org/codec-lz4`).
+> Transform kinds should be globally namespaced to prevent collisions (e.g. `npm:@my-org/transform-aes-gcm` or `jsr:@my-org/transform-lz4`).
 
 ---
 
-## 5. Terminal JSON Value Codec
+## 5. Body Serialization & Encoding
 
-The `JsonValueCodec` is the core terminal serializer in the read/write pipeline.
-
-### 5.1 Encoding
+### 5.1 Serialization
 For any defined session value `value: T`:
-- It MUST serialize the value using `JSON.stringify(value)`.
-- It MUST return a `StorageEnvelope` structure:
-  ```json
-  {
-    "kind": "grammy-extended-storage-envelope",
-    "codec": "grammy-extended-storage-value",
-    "version": "1.0.0",
-    "payload": "<JSON string>"
-  }
-  ```
-- If stringification fails or produces `undefined`, encoding MUST throw an error.
-- **Top-Level `undefined` Special Case**: Before encoding, the adapter MUST intercept top-level `undefined` session writes, treating them as deletion requests (delegated directly to `storage.delete(key)`), bypassing the serialization pipeline.
+- The adapter MUST serialize it with `JSON.stringify(value)`.
+- If stringification throws or produces a non-string (e.g. for a function or `undefined`), the adapter MUST throw `ERR_VALUE_SERIALIZATION` and MUST NOT write.
+- **Top-Level `undefined` Special Case**: the adapter MUST intercept top-level `undefined` session writes, treating them as deletion requests (delegated directly to `storage.delete(key)`), bypassing the pipeline.
 
-### 5.2 Decoding
-When encountering an envelope with `codec === VALUE_CODEC_ID`:
-- The adapter MUST verify that `version === VALUE_CODEC_VERSION`.
-- If the version mismatches, decoding MUST throw an error.
-- If the version is correct, it MUST return `JSON.parse(envelope.payload) as T`.
-- Any JSON parsing exceptions MUST propagate up as errors.
+### 5.2 Encoding Rule
+The `encoding` field records how `body` encodes the final bytes:
+- **Zero transforms**: `encoding` is `"utf8"` and `body` is the JSON text itself. Rows stay human-readable in the database and no byte round trip is performed.
+- **One or more transforms**: `encoding` is `"base64"` and `body` is the standard base64 encoding of the last transform's output bytes.
 
-### 5.3 Rich Types Limitation
+On read the adapter honours the stored `encoding` field regardless of the number of records, so an envelope is always self-describing. A `base64` body that is not valid base64 makes the underlying decoder throw a native error (`TypeError` for an invalid character, `RangeError` for an invalid length), which propagates unchanged.
+
+### 5.3 Deserialization
+After the body pass (§10), the adapter decodes the bytes as UTF-8 in fatal mode and returns `JSON.parse(text) as T`. Native UTF-8 decoding errors and JSON parsing errors propagate unchanged.
+
+### 5.4 Rich Types Limitation
 Because serialization relies on standard JSON:
 - Sessions must be JSON-serializable.
 - Rich JS classes and types (`Date`, `Map`, `Set`, `bigint`, cyclic graphs, functions, and symbols) are **not preserved** and will be degraded or raise serialization exceptions.
@@ -250,68 +254,81 @@ Because serialization relies on standard JSON:
 
 ## 6. Runtime Invariant Validations
 
-To protect storage integrity, the adapter MUST execute runtime validation of envelopes whenever data crosses a boundary (upon reading from storage, and before/after passing data to any custom codec).
+To protect storage integrity, the adapter MUST validate every envelope read from storage with `assertValidEnvelope(value)`, which requires:
+1. The value is a non-null `object` and not an array.
+2. `kind` matches `STORAGE_ENVELOPE_KIND` exactly.
+3. `version` is a string.
+4. `transforms` is an array, and every element is a non-null, non-array object with a non-empty string `kind`, a string `version`, and a `meta` that is a non-null, non-array object.
+5. `encoding` is exactly `"utf8"` or `"base64"`.
+6. `body` is a string.
 
-An object is validated by `assertValidEnvelope(value)` and must satisfy:
-1. The value is a non-null `object`.
-2. The value is not an array.
-3. The `kind` property matches `STORAGE_ENVELOPE_KIND` exactly.
-4. The `codec` property is a non-empty string.
-5. The `version` property is a string.
-6. The `payload` property is a string.
+Failure to satisfy any of these conditions MUST throw an `ExtendedStorageError` with code `ERR_INVALID_ENVELOPE`.
 
-Failure to satisfy any of these conditions MUST throw an immediate validation error: an `ExtendedStorageError` with code `ERR_INVALID_ENVELOPE`.
-
-An envelope MAY carry additional properties beyond the four required ones; the adapter ignores unknown properties. Codec families may use this to extend their own envelopes across versions.
+An envelope MAY carry additional properties beyond the required ones; the adapter ignores unknown properties.
 
 ---
 
-## 7. Custom Envelope Codec Contract
+## 7. Transform Contract
 
-Custom codecs (e.g., for encryption or compression) must comply with the following contracts:
-
-### 7.1 `codec` property
-Acts as the identifier for the codec family. It must remain stable across different versions of the format.
+### 7.1 `kind` property
+Acts as the identifier for the transform family. It must remain stable across different versions of the format.
 
 ### 7.2 `version` property
-Represents the format version produced by `encode()`. The adapter treats this as an opaque string, but codec authors should use semantic versioning (SemVer) to manage format transitions.
+Represents the format version produced by `encode()`. The adapter treats this as an opaque string and copies it into the record verbatim, but transform authors should use semantic versioning (SemVer) to manage format transitions.
 
-### 7.3 `encode(envelope)`
-- **Input**: A validated inner `StorageEnvelope`.
-- **Output**: A validated outer `StorageEnvelope` wrapping the inner envelope.
+### 7.3 `encode(body)`
+- **Input**: The current body bytes (`Uint8Array`).
+- **Output**: `{ body: Uint8Array, meta?: Record<string, unknown> }`.
 - **Rules**:
-  - The returned envelope's `codec` and `version` fields MUST match the codec's declared properties.
-  - The inner envelope MUST be serialized into the output's `payload` string, such that `decode` can recover it. The adapter cannot verify this (payload inspection is a non-goal, §14) — it validates only the output's shape and identity fields. Round-trip fidelity is therefore a trust-based contract on codec authors; codec implementations should be round-trip tested, since a violation surfaces only at read time.
-  - `encode` MUST NEVER return `undefined`.
+  - `body` MUST be a `Uint8Array`. `meta`, if present, MUST be a non-null, non-array object; a missing `meta` is recorded as `{}`. Any other output makes the adapter throw `ERR_INVALID_TRANSFORM_OUTPUT` before writing.
+  - `meta` MUST be JSON-serializable, since it is stored verbatim in the envelope. The adapter cannot verify this; it is a trust-based contract like round-trip fidelity.
+  - `meta` is stored **in plaintext**, outside whatever the body transforms do. It is neither encrypted nor authenticated by the adapter, and anyone with database access can read or edit it. Do not put secrets in `meta`, and do not rely on it for tamper resistance.
+  - A transform MAY leave the body unchanged and only attach `meta` (e.g. an expiry transform).
 
-### 7.4 `decode(envelope)`
-- **Input**: A validated outer `StorageEnvelope` owned by this codec family.
-- **Output**: The next inner `StorageEnvelope`, or `undefined` to signal implicit session expiration/deletion.
+### 7.4 `decode(body, record)`
+- **Input**: The body bytes as produced by this transform's `encode` (or by a later transform's `decode`), plus the `StorageTransformRecord` stored for this transform. The record carries the `version` and `meta` written at encode time, which may be older than the transform's current `version`.
+- **Output**: The restored body bytes (`Uint8Array`).
 - **Rules**:
-  - The codec's `decode` is responsible for handling historical version backward compatibility.
-  - It MUST throw an error if the payload cannot be decrypted, decompressed, or parsed, or if the format version is unsupported.
+  - `decode` is responsible for handling historical version backward compatibility, using `record.version`.
+  - It MUST throw if the body cannot be decrypted, decompressed, or otherwise restored, or if `record.version` is unsupported.
+  - It MUST NOT be used to signal expiry: a non-`Uint8Array` return makes the adapter throw `ERR_INVALID_TRANSFORM_OUTPUT`.
 
-### 7.5 Layer Ordering & Size Considerations
+### 7.5 `isExpired(record)` (optional)
+- **Input**: The `StorageTransformRecord` stored for this transform.
+- **Output**: `true` if the entry should be treated as expired, `false` otherwise.
+- **Rules**:
+  - The check MUST derive its answer from the record alone (typically `record.meta`); the body is not available and is never decoded before the check.
+  - Returning `true` from any transform expires the whole entry (§10, §11).
+  - Errors thrown by `isExpired` propagate unchanged and do not delete the entry.
+  - Anything that must influence expiry (e.g. a body-derived value) must be materialised into `meta` at encode time.
+
+### 7.6 Read-only transforms
+`readOnlyTransforms` registers transforms for the read side only. A read-only transform needs just `kind`, `decode`, and optionally `isExpired`; a full `StorageTransform` is structurally acceptable too, but its `encode` and `version` are ignored.
+
+- Read-only transforms are **never** applied on write and never appear in new records.
+- They participate fully in the read pipeline (§10): resolution, the expiry pass, and the body pass treat them exactly like write transforms.
+- Their `kind` must satisfy §4.1 and must be unique across **both** lists; a kind present in `transforms` and `readOnlyTransforms` is rejected with `ERR_DUPLICATE_TRANSFORM_KIND`.
+
+**Retiring a format**: move the transform from `transforms` to `readOnlyTransforms`. New writes stop producing its records while existing rows remain readable. Each row is rewritten in the current format on its next `write`. Once no rows reference the kind, remove it from `readOnlyTransforms`; any remaining row would then fail with `ERR_UNKNOWN_TRANSFORM`.
+
+### 7.7 Layer Ordering & Size Considerations
 
 > [!TIP]
-> **Ordering matters semantically, not mechanically.** The adapter applies codecs in declaration order regardless of what they do, but some orders defeat their purpose: compression must come **before** encryption, because encrypted (high-entropy) data does not compress. In §1.1's example terms, Codec A is compression and Codec B is encryption for exactly this reason.
+> **Ordering matters semantically, not mechanically.** The adapter applies transforms in declaration order regardless of what they do, but some orders defeat their purpose: compression must come **before** encryption, because encrypted (high-entropy) data does not compress. In §1.1's example terms, Transform A is compression for exactly this reason.
 
 > [!NOTE]
-> **Size amplification**: each layer serializes the entire inner envelope into its own string `payload`, so stored size grows with every layer — nested JSON string escaping and any base64-style expansion compound across layers. Keep the layer count small, and prefer codecs with compact payload representations.
+> **Size**: the body is stored once, as a single string, regardless of how many transforms are applied; records add only their `kind`, `version`, and `meta`. Base64 encoding costs roughly 33% over the raw bytes whenever at least one transform is configured.
 
 ---
 
 ## 8. Construction & Initialization
 
 When calling `createExtendedStorage(options)`:
-1. **Normalisation**: If `options.codecs` is missing, default to an empty list.
-2. **Uniqueness**: Ensure that no two codecs share the same `codec` identifier.
-3. **Validation**: Check each codec against the reserved identifier rules.
-4. **Immutability**: The set of codecs and their metadata is fixed at construction time. Subsequent mutation of the source options array MUST NOT alter the adapter's behavior.
-5. **Decode Depth Limit**: Resolve the effective `maxDecodeDepth`: use `options.maxDecodeDepth` if provided, otherwise default to `codecs.length + 16`. If provided, the value MUST be a positive integer; otherwise construction MUST throw a validation error.
-
-> [!NOTE]
-> The depth limit exists only to bound pathological decode cycles (e.g. two codecs whose `decode` outputs ping-pong between each other's identifiers). Repeated decodes of the same codec are legitimate — historical data may have been wrapped by the same codec more than once — so the default grants headroom beyond the registered codec count.
+1. **Normalisation**: If `options.transforms` or `options.readOnlyTransforms` is missing, default it to an empty list.
+2. **Validation**: Check each transform's `kind`, across both lists, against the rules in §4.1 (`ERR_EMPTY_TRANSFORM_KIND`, `ERR_RESERVED_TRANSFORM_KIND`).
+3. **Uniqueness**: Ensure that no two transforms across both lists share the same `kind` (`ERR_DUPLICATE_TRANSFORM_KIND`).
+4. **Registry**: The **write pipeline** is `transforms` in declaration order. The **read registry** is the union of `transforms` and `readOnlyTransforms`, keyed by `kind`.
+5. **Immutability**: Both sets are fixed at construction time. Subsequent mutation of the source options arrays MUST NOT alter the adapter's behavior.
 
 ---
 
@@ -320,14 +337,16 @@ When calling `createExtendedStorage(options)`:
 When the bot writes session data via `write(key, value)`:
 
 1. **Delete Interception**: If `value === undefined`, invoke `storage.delete(key)` and return immediately.
-2. **Initial Serialization**: Serialize the session state using the internal terminal JSON Value Codec.
-3. **Shape Check**: Run `assertValidEnvelope` on the serialized envelope.
-4. **Layer Application**: For each custom codec in the `codecs` option, in **declaration order**:
-   1. Invoke `codec.encode(currentEnvelope)`.
-   2. Run `assertValidEnvelope` on the output.
-   3. Verify that the output's `codec` and `version` match the codec's registered properties.
-   4. Update `currentEnvelope` to this output.
-5. **Physical Storage**: Save the final outermost envelope to the underlying storage using `storage.write(key, currentEnvelope)`.
+2. **Serialization**: Produce the JSON text per §5.1.
+3. **Zero-Transform Shortcut**: If no transforms are configured, write the `utf8` envelope per §5.2 and return.
+4. **Transform Application**: Encode the text as UTF-8 bytes. For each transform in **declaration order**:
+   1. Invoke `transform.encode(currentBytes)`.
+   2. Validate the output per §7.3.
+   3. Append `{ kind: transform.kind, version: transform.version, meta: output.meta ?? {} }` to the record list.
+   4. Set `currentBytes` to `output.body`.
+5. **Physical Storage**: Write `{ kind, version: PACKAGE_VERSION, transforms: records, encoding: "base64", body: base64(currentBytes) }` via `storage.write(key, envelope)`.
+
+Any error in steps 2–4 propagates and no write occurs.
 
 ---
 
@@ -337,39 +356,35 @@ When the bot requests session data via `read(key)`:
 
 1. **Physical Read**: Fetch the entry from underlying storage.
 2. **Miss Handling**: If the database returns `undefined`, return `undefined` immediately.
-3. **Loop Initialization**: Set the retrieved envelope as `currentEnvelope` and set `decodeDepth = 0`.
-4. **Decoding Loop**:
-   1. Run `assertValidEnvelope(currentEnvelope)`.
-   2. **Terminal Case**: If `currentEnvelope.codec === VALUE_CODEC_ID`, decode it using the JSON Value Codec and return the decoded session object `T` to the caller.
-   3. **Depth Check**: If `decodeDepth >= maxDecodeDepth` (the effective limit resolved at construction, see §8), throw a decode depth limit error.
-   4. **Codec Lookup**: Find the registered custom codec matching `currentEnvelope.codec`. If not found, throw an error.
-   5. **Execution**: Pass the envelope to the custom codec's `decode` method.
-   6. **Tombstone Case**: If `decode` returns `undefined` (tombstone / logical absence):
-      1. Trigger an automatic cleanup call: `await storage.delete(key)`. Cleanup is **best-effort**: if the delete fails, the error MUST NOT propagate — the session was already determined to be logically absent.
-      2. Halt processing and return `undefined` to the caller.
-   7. **Progress**: Increment `decodeDepth`, set `currentEnvelope` to the decoded inner envelope, and repeat the loop.
+3. **Validation**: Run `assertValidEnvelope` on the retrieved value.
+4. **Transform Resolution**: For every record in `envelope.transforms`, look up the transform with the same `kind` in the read registry (§8, which includes `readOnlyTransforms`). If any is missing, throw `ERR_UNKNOWN_TRANSFORM` naming the kind. Resolution completes before any expiry check runs.
+5. **Expiry Pass**: For each resolved record in **recorded order**, if the transform defines `isExpired`, await `isExpired(record)`. On the first `true`:
+   1. Trigger a best-effort cleanup: `await storage.delete(key)`. If the delete fails, the error MUST NOT propagate.
+   2. Return `undefined` to the caller without decoding the body.
+6. **Body Pass**: Decode `body` according to `encoding` (§5.2); base64 decoding errors propagate unchanged. For each resolved record in **reverse recorded order**, set `currentBytes = await transform.decode(currentBytes, record)`, throwing `ERR_INVALID_TRANSFORM_OUTPUT` if the result is not a `Uint8Array`.
+7. **Deserialization**: Return the value per §5.3.
 
 > [!NOTE]
-> **Data-Driven Routing**: Because decoding routes dynamically via the `codec` metadata on the envelopes, changing the sequence of `codecs` in the options does not break the ability to read pre-existing data, as long as all required codecs remain registered.
+> **Record-Driven Routing**: Because decoding follows the records stored in the envelope, changing the order of `transforms` in the options does not break the ability to read pre-existing data, as long as all required transforms remain registered. Each record is decoded exactly once, so no depth limit is needed.
 
 ---
 
-## 11. Deletion & Tombstones
+## 11. Deletion & Expiry
 
 ```
                Direct Delete
             ───────────────────►  [storage.delete(key)]
-            
-            
-            Implicit Delete (during read decode)
-            [decode(env)] ───► returns undefined (Tombstone)
-                                    │
-                                    ▼
-                          [storage.delete(key)]
+
+
+            Implicit Delete (during the expiry pass)
+            [isExpired(record)] ───► returns true
+                                        │
+                                        ▼
+                              [storage.delete(key)]
 ```
 
-- **Direct Deletion**: `delete(key)` bypasses the codec pipeline and invokes the underlying storage's `delete` method directly.
-- **Implicit Cleanup**: When a custom codec indicates that a session is expired or revoked (by returning `undefined` from `decode`), the adapter automatically executes a database cleanup delete for that key. This applies to **every** decode path where the key is known — `read(key)`, `has(key)`, and bulk iteration in §12 — not only the single-read flow. The sole exception is keyless value iteration (`readAllValues` derived from underlying `readAllValues`, see §12.3), where the key is unavailable and no cleanup is possible. Cleanup is best-effort: failures of the cleanup delete MUST NOT propagate or alter the decode outcome.
+- **Direct Deletion**: `delete(key)` bypasses the pipeline and invokes the underlying storage's `delete` method directly.
+- **Implicit Cleanup**: When a transform reports an entry as expired, the adapter automatically executes a cleanup delete for that key. This applies to **every** path where the key is known — `read(key)`, `has(key)`, and bulk iteration in §12 — not only the single-read flow. The sole exception is keyless value iteration (`readAllValues` derived from underlying `readAllValues`, see §12.3), where the key is unavailable and no cleanup is possible. Cleanup is best-effort: failures of the cleanup delete MUST NOT propagate or alter the outcome.
 
 ---
 
@@ -378,55 +393,62 @@ When the bot requests session data via `read(key)`:
 If the underlying storage supports bulk capabilities, the layered adapter selectively exposes them if they can be implemented soundly.
 
 > [!NOTE]
-> The factory's declared return type is grammY's `StorageAdapter<T>`, which declares only `read`/`write`/`delete`. All capabilities in this section — including `has` — are attached at runtime but are not part of the static type contract; TypeScript consumers must narrow or cast the adapter to access them.
+> grammY's `StorageAdapter<T>` declares `has`, `readAllKeys`, `readAllValues`, and `readAllEntries` as **optional** members, and the adapter returned here satisfies that type. `has` is always present. The bulk methods are present only under the conditions below, so TypeScript consumers must check for presence before calling them; no cast is needed.
 
 ### 12.1 `has(key)`
-- Always attached to the adapter at runtime (though not part of the declared return type — see note above).
-- Implemented as: `(await read(key)) !== undefined`.
-- **Warning**: Calling `has` performs a full read/decode cycle, meaning it may trigger implicit deletion side-effects if a session has expired. It must **not** forward blindly to the underlying storage's `.has()` method. Note also the cost: every `has` call pays the entire decode pipeline — potentially decompression and decryption — making it far more expensive than a typical existence check.
+- Always attached to the adapter at runtime.
+- Implemented as §10 steps 1–5: read the envelope, validate it, resolve its transforms, and run the expiry pass. Returns `false` for a missing or expired entry (performing cleanup for the latter) and `true` otherwise. **The body is never decoded.**
+- It must **not** forward to the underlying storage's `.has()` method, which cannot run the expiry pass.
+- Because `has` skips the body pass, it does not detect a corrupt body; a subsequent `read` may still throw.
 
 ### 12.2 `readAllKeys()`
 Exposed if the underlying storage implements `readAllEntries` or `readAllKeys`.
-- Yields only keys whose sessions successfully decode and do not evaluate to `undefined`.
-- If the underlying storage implements `readAllEntries()`, it iterates over the entries and decodes each envelope.
-- Otherwise, it falls back to iterating backing keys and executing a full `read(key)` for each key.
-- Iteration performs implicit cleanup (§11): tombstoned keys encountered along the way are deleted from the underlying storage.
+- Yields only keys whose entries validate and are not expired. Bodies are never decoded.
+- If the underlying storage implements `readAllEntries()`, it iterates the entries and runs §10 steps 3–5 on each envelope.
+- Otherwise, it falls back to iterating backing keys and calling `has(key)` for each.
+- Iteration performs implicit cleanup (§11) for expired keys encountered along the way.
 
 ### 12.3 `readAllValues()`
-Exposed if the underlying storage implements `readAllEntries` or `readAllValues`.
-- Yields only fully decoded session values of type `T` (filtering out `undefined` tombstones).
-- **Caveat**: If deriving values solely from `readAllValues` without keys, the adapter cannot delete tombstones from the underlying database because the keys are unavailable. This is the only decode path without implicit cleanup (§11).
+Exposed if the underlying storage implements `readAllEntries`, `readAllValues`, or `readAllKeys`, preferred in that order.
+- Yields only fully decoded session values of type `T`, skipping expired entries.
+- From entries: decodes each envelope with its key, performing implicit cleanup (§11).
+- From values: decodes each envelope without a key.
+  **Caveat**: on this path the adapter cannot delete expired entries from the underlying database because the keys are unavailable. This is the only path without implicit cleanup (§11).
+- From keys: iterates backing keys and executes a full `read(key)` for each, performing implicit cleanup.
 
 ### 12.4 `readAllEntries()`
 Exposed if the underlying storage implements `readAllEntries` or `readAllKeys`.
-- Yields `[key, T]` pairs where `T !== undefined`.
+- Yields `[key, T]` pairs for live entries.
 - Prefers iterating entries, but falls back to iterating keys and fetching each key.
-- Iteration performs implicit cleanup (§11): tombstoned keys encountered along the way are deleted from the underlying storage.
+- Iteration performs implicit cleanup (§11) for expired keys encountered along the way.
 
 ### 12.5 Error Semantics
-Bulk iteration is **fail-fast**: if any entry fails envelope validation, references an unregistered codec, or its codec's `decode` throws, the error propagates and the stream terminates — identical semantics to a single `read(key)`. Entries are never skipped or quarantined; one corrupt row fails the entire bulk operation. Callers needing resilience must iterate keys and handle per-key errors themselves.
+Bulk iteration is **fail-fast**: if any entry fails envelope validation, references an unregistered transform, or a transform's `isExpired` or `decode` throws, the error propagates and the stream terminates — identical semantics to a single `read(key)`. Entries are never skipped or quarantined; one corrupt row fails the entire bulk operation.
+
+Callers needing resilience must iterate the **underlying** storage's `readAllKeys()` and call the wrapper's `read(key)` per key inside their own error handling. The wrapper's own `readAllKeys()` is not suitable for recovery: it validates every envelope before yielding its key, so it terminates on the corrupt row before the caller sees that key.
 
 ---
 
 ## 13. Error Reference Matrix
 
-The adapter guarantees that errors are thrown under the following circumstances. All adapter-raised errors are instances of `ExtendedStorageError` carrying the listed `code`; errors thrown by custom codecs and by `JSON.parse` propagate unchanged.
+The adapter guarantees that errors are thrown under the following circumstances. All adapter-raised errors are instances of `ExtendedStorageError` carrying the listed `code`; errors thrown by transforms, by base64 decoding, by UTF-8 decoding, and by `JSON.parse` propagate unchanged.
 
 | Phase | Failure Trigger | Thrown Error |
 | :--- | :--- | :--- |
-| **Construction** | A codec identifier is empty. | `ERR_EMPTY_CODEC_ID` |
-| **Construction** | Two codecs declare the identical identifier. | `ERR_DUPLICATE_CODEC_ID` |
-| **Construction** | A codec uses `grammy-extended-storage-value` or reserved prefixes. | `ERR_RESERVED_CODEC_ID` |
-| **Construction** | `maxDecodeDepth` is not a positive integer. | `ERR_INVALID_MAX_DECODE_DEPTH` |
-| **Runtime Write** | `JSON.stringify` throws or produces invalid/`undefined` output. | `ERR_VALUE_SERIALIZATION` |
-| **Runtime Write** | A codec returns an object that fails shape invariants. | `ERR_INVALID_ENVELOPE` |
-| **Runtime Write** | A codec's output `codec`/`version` doesn't match its ID. | `ERR_CODEC_IDENTITY_MISMATCH` |
-| **Runtime Read** | Database returns an object failing envelope invariants. | `ERR_INVALID_ENVELOPE` |
-| **Runtime Read** | Value codec version is not `1.0.0`. | `ERR_UNSUPPORTED_VALUE_VERSION` |
-| **Runtime Read** | JSON parsing of terminal payload fails. | Native parse error, propagated unchanged. |
-| **Runtime Read** | Envelope codec identifier is not registered. | `ERR_UNKNOWN_CODEC` |
-| **Runtime Read** | Decode chain depth hits the effective `maxDecodeDepth`. | `ERR_DECODE_DEPTH_EXCEEDED` |
-| **Runtime Read** | A codec fails to decode internally. | The codec's own error, propagated unchanged. |
+| **Construction** | A transform kind is empty. | `ERR_EMPTY_TRANSFORM_KIND` |
+| **Construction** | A transform kind begins with the reserved prefix. | `ERR_RESERVED_TRANSFORM_KIND` |
+| **Construction** | Two transforms declare the identical kind. | `ERR_DUPLICATE_TRANSFORM_KIND` |
+| **Runtime Write** | `JSON.stringify` throws or produces a non-string. | `ERR_VALUE_SERIALIZATION` |
+| **Runtime Write** | A transform's `encode` output fails §7.3 shape rules. | `ERR_INVALID_TRANSFORM_OUTPUT` |
+| **Runtime Write** | A transform's `encode` throws. | The transform's own error, propagated unchanged. |
+| **Runtime Read** | Database returns a value failing envelope invariants. | `ERR_INVALID_ENVELOPE` |
+| **Runtime Read** | A recorded transform kind is not registered. | `ERR_UNKNOWN_TRANSFORM` |
+| **Runtime Read** | A transform's `isExpired` throws. | The transform's own error, propagated unchanged. |
+| **Runtime Read** | A transform's `decode` returns a non-`Uint8Array`. | `ERR_INVALID_TRANSFORM_OUTPUT` |
+| **Runtime Read** | A transform's `decode` throws. | The transform's own error, propagated unchanged. |
+| **Runtime Read** | `encoding` is `base64` but `body` is not valid base64. | Native `TypeError` or `RangeError`, propagated unchanged. |
+| **Runtime Read** | Final bytes are not valid UTF-8. | Native `TypeError`, propagated unchanged. |
+| **Runtime Read** | JSON parsing of the final text fails. | Native parse error, propagated unchanged. |
 
 ---
 
@@ -436,5 +458,7 @@ This specification does **not** mandate or cover:
 - Semantic Versioning (SemVer) format validation by the adapter.
 - Custom validation schemas for the user session type `T`.
 - Transparent support for legacy raw database values (migration is the caller's responsibility).
-- Replacement of the terminal JSON Value Codec with other serialization systems.
-- Codec-private payload inspection by the core adapter.
+- Replacement of the JSON body serialization with other serialization systems.
+- Verification that transform `meta` is JSON-serializable, or that `encode`/`decode` round-trip.
+- Confidentiality or integrity of transform `meta`; it is plaintext by design so that expiry checks stay cheap.
+- Body inspection by the core adapter.

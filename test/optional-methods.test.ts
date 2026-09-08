@@ -2,7 +2,12 @@ import { assert, assertEquals, assertStrictEquals } from "@std/assert";
 import { MemorySessionStorage, type StorageAdapter } from "grammy";
 
 import { createExtendedStorage, type StorageEnvelope } from "../src/mod.ts";
-import { missingCodec, validEnvelope } from "./helpers.ts";
+import {
+  record,
+  type SpyTransform,
+  spyTransform,
+  validEnvelope,
+} from "./helpers.ts";
 
 type FlexibleIterable<T> = Iterable<T> | AsyncIterable<T>;
 
@@ -30,36 +35,50 @@ function setMethods(
   return storage;
 }
 
+/** Transforms shared by every fixture: a body-changing one and an expiry one. */
+function fixtureTransforms(): { rev: SpyTransform; ttl: SpyTransform } {
+  return {
+    rev: spyTransform("rev", { reverse: true }),
+    ttl: spyTransform("ttl", {
+      expired: (r) => r.meta.dead === true,
+    }),
+  };
+}
+
+/**
+ * Writes "a" and "b" as live entries and "gone" as an expired entry
+ * (its ttl record carries `meta.dead = true`).
+ */
 async function writeOptionalFixtures(
   storage: FlexibleStorage,
+  transforms: { rev: SpyTransform; ttl: SpyTransform },
 ): Promise<{
   entries: Array<[string, StorageEnvelope]>;
   keys: string[];
   values: StorageEnvelope[];
 }> {
-  const writer = createExtendedStorage<unknown>({ storage });
+  const writer = createExtendedStorage<unknown>({
+    storage,
+    transforms: [transforms.rev, transforms.ttl],
+  });
   await writer.write("a", { value: 1 });
-  await storage.write("gone", validEnvelope({ codec: "gone-codec" }));
+  await storage.write(
+    "gone",
+    validEnvelope({
+      transforms: [record("ttl", { meta: { dead: true } })],
+      body: "0",
+    }),
+  );
   await writer.write("b", ["two"]);
 
-  const a = await storage.read("a");
-  if (a === undefined) {
-    throw new Error('Fixture key "a" missing from storage');
+  const entries: Array<[string, StorageEnvelope]> = [];
+  for (const key of ["a", "gone", "b"]) {
+    const envelope = await storage.read(key);
+    if (envelope === undefined) {
+      throw new Error(`Fixture key "${key}" missing from storage`);
+    }
+    entries.push([key, envelope]);
   }
-  const gone = await storage.read("gone");
-  if (gone === undefined) {
-    throw new Error('Fixture key "gone" missing from storage');
-  }
-  const b = await storage.read("b");
-  if (b === undefined) {
-    throw new Error('Fixture key "b" missing from storage');
-  }
-
-  const entries: Array<[string, StorageEnvelope]> = [
-    ["a", a],
-    ["gone", gone],
-    ["b", b],
-  ];
 
   return {
     entries,
@@ -76,260 +95,402 @@ async function collectAsync<T>(iterable: FlexibleIterable<T>): Promise<T[]> {
   return values;
 }
 
-Deno.test("VAL-OPT-001 has is exposed and uses wrapped read semantics", async () => {
-  const storage = backing();
-  const writer = createExtendedStorage<unknown>({ storage });
+function readsOf(storage: FlexibleStorage): { count: number } {
+  const originalRead = storage.read.bind(storage);
+  const calls = { count: 0 };
+  storage.read = (key: string) => {
+    calls.count++;
+    return originalRead(key);
+  };
+  return calls;
+}
 
-  await writer.write("present", { ok: true });
-  await storage.write("gone", validEnvelope({ codec: "gone-codec" }));
-  setMethods(storage, { has: () => false });
-  const adapter = createExtendedStorage<unknown>({
+// ---------------------------------------------------------------------------
+// has
+// ---------------------------------------------------------------------------
+
+Deno.test("VAL-OPT-001 has reports live entries without decoding the body", async () => {
+  const storage = backing();
+  const transforms = fixtureTransforms();
+  await writeOptionalFixtures(storage, transforms);
+  transforms.rev.calls.decode = 0;
+  const adapter = createExtendedStorage({
     storage,
-    codecs: [missingCodec("gone-codec")],
+    transforms: [transforms.rev, transforms.ttl],
   });
 
-  assert(adapter.has);
-  assertEquals(await adapter.has("present"), true);
-  assertEquals(await adapter.has("gone"), false);
+  assertEquals(await adapter.has!("a"), true);
+  assertEquals(await adapter.has!("missing"), false);
+  assertEquals(transforms.rev.calls.decode, 0);
+});
+
+Deno.test("VAL-OPT-002 has reports expired entries as absent and cleans them up", async () => {
+  const storage = backing();
+  const transforms = fixtureTransforms();
+  await writeOptionalFixtures(storage, transforms);
+  const adapter = createExtendedStorage({
+    storage,
+    transforms: [transforms.rev, transforms.ttl],
+  });
+
+  assertEquals(await adapter.has!("gone"), false);
+  assertEquals(await storage.read("gone"), undefined);
+  assertEquals(transforms.rev.calls.decode, 0);
+});
+
+Deno.test("VAL-OPT-003 has does not forward to the backing has", async () => {
+  const storage = backing();
+  const transforms = fixtureTransforms();
+  await writeOptionalFixtures(storage, transforms);
+  let backingHasCalls = 0;
+  setMethods(storage, {
+    has: () => {
+      backingHasCalls++;
+      return true;
+    },
+  });
+  const adapter = createExtendedStorage({
+    storage,
+    transforms: [transforms.rev, transforms.ttl],
+  });
+
+  assertEquals(await adapter.has!("gone"), false);
+  assertEquals(await adapter.has!("missing"), false);
+  assertEquals(backingHasCalls, 0);
+});
+
+Deno.test("VAL-OPT-004 has is exposed when the backing adapter does not expose has", async () => {
+  const storage = backing();
+  setMethods(storage, { has: undefined });
+  const adapter = createExtendedStorage({ storage });
+  await adapter.write("a", 1);
+
+  assertEquals(typeof adapter.has, "function");
+  assertEquals(await adapter.has!("a"), true);
+});
+
+// ---------------------------------------------------------------------------
+// readAllKeys
+// ---------------------------------------------------------------------------
+
+Deno.test("VAL-OPT-005 readAllKeys from entries yields live keys without decoding bodies", async () => {
+  const storage = backing();
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  setMethods(storage, {
+    readAllKeys: undefined,
+    readAllValues: undefined,
+    readAllEntries: () => fixtures.entries,
+  });
+  const adapter = createExtendedStorage({
+    storage,
+    transforms: [transforms.rev, transforms.ttl],
+  });
+
+  assertEquals(await collectAsync(adapter.readAllKeys!()), ["a", "b"]);
+  assertEquals(transforms.rev.calls.decode, 0);
   assertEquals(await storage.read("gone"), undefined);
 });
 
-Deno.test("VAL-OPT-002 has is exposed when backing adapter does not expose has", async () => {
-  const storage = setMethods(backing(), { has: undefined });
-  const adapter = createExtendedStorage<unknown>({ storage });
-
-  assertStrictEquals(typeof adapter.has, "function");
-  assert(adapter.has);
-  assertEquals(await adapter.has("missing"), false);
-});
-
-Deno.test("VAL-OPT-003 readAllKeys yields only keys whose decoded value is not undefined", async () => {
+Deno.test("VAL-OPT-006 readAllKeys from keys uses has per key", async () => {
   const storage = backing();
-  const { keys } = await writeOptionalFixtures(storage);
-  setMethods(storage, { readAllKeys: () => keys });
-  const adapter = createExtendedStorage<unknown>({
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  setMethods(storage, {
+    readAllKeys: () => fixtures.keys,
+    readAllValues: undefined,
+    readAllEntries: undefined,
+  });
+  const adapter = createExtendedStorage({
     storage,
-    codecs: [missingCodec("gone-codec")],
+    transforms: [transforms.rev, transforms.ttl],
   });
 
-  assert(adapter.readAllKeys);
-  assertEquals(await collectAsync(adapter.readAllKeys()), ["a", "b"]);
+  assertEquals(await collectAsync(adapter.readAllKeys!()), ["a", "b"]);
+  assertEquals(transforms.rev.calls.decode, 0);
+  assertEquals(await storage.read("gone"), undefined);
 });
 
-Deno.test("VAL-OPT-004 readAllKeys is omitted without all-key or all-entry capability", () => {
+Deno.test("VAL-OPT-007 readAllKeys is omitted without all-key or all-entry capability", () => {
   const storage = setMethods(backing(), {
     readAllKeys: undefined,
     readAllEntries: undefined,
   });
-  const adapter = createExtendedStorage<unknown>({ storage });
+  const adapter = createExtendedStorage({ storage });
 
   assertStrictEquals(adapter.readAllKeys, undefined);
 });
 
-Deno.test("VAL-OPT-005 readAllValues yields only decoded values and filters undefined", async () => {
+// ---------------------------------------------------------------------------
+// readAllValues
+// ---------------------------------------------------------------------------
+
+Deno.test("VAL-OPT-008 readAllValues from entries yields decoded live values and cleans up expired keys", async () => {
   const storage = backing();
-  const { values } = await writeOptionalFixtures(storage);
-  setMethods(storage, { readAllValues: () => values });
-  const adapter = createExtendedStorage<unknown>({
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  setMethods(storage, {
+    readAllKeys: undefined,
+    readAllValues: undefined,
+    readAllEntries: () => fixtures.entries,
+  });
+  const adapter = createExtendedStorage({
     storage,
-    codecs: [missingCodec("gone-codec")],
+    transforms: [transforms.rev, transforms.ttl],
   });
 
-  assert(adapter.readAllValues);
-  assertEquals(await collectAsync(adapter.readAllValues()), [
+  assertEquals(await collectAsync(adapter.readAllValues!()), [
     { value: 1 },
     ["two"],
   ]);
+  assertEquals(await storage.read("gone"), undefined);
 });
 
-Deno.test("VAL-OPT-006 readAllValues is omitted without values or entries", () => {
-  const storage = setMethods(backing(), {
+Deno.test("VAL-OPT-009 readAllValues from values filters expired entries but cannot clean them up", async () => {
+  const storage = backing();
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  setMethods(storage, {
+    readAllKeys: undefined,
+    readAllValues: () => fixtures.values,
+    readAllEntries: undefined,
+  });
+  const adapter = createExtendedStorage({
+    storage,
+    transforms: [transforms.rev, transforms.ttl],
+  });
+
+  assertEquals(await collectAsync(adapter.readAllValues!()), [
+    { value: 1 },
+    ["two"],
+  ]);
+  assert((await storage.read("gone")) !== undefined);
+});
+
+Deno.test("VAL-OPT-010 readAllValues from keys reads each key and cleans up expired keys", async () => {
+  const storage = backing();
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  setMethods(storage, {
+    readAllKeys: () => fixtures.keys,
     readAllValues: undefined,
     readAllEntries: undefined,
   });
-  const adapter = createExtendedStorage<unknown>({ storage });
+  const adapter = createExtendedStorage({
+    storage,
+    transforms: [transforms.rev, transforms.ttl],
+  });
+  const reads = readsOf(storage);
+
+  assertEquals(await collectAsync(adapter.readAllValues!()), [
+    { value: 1 },
+    ["two"],
+  ]);
+  assertEquals(reads.count, 3);
+  assertEquals(await storage.read("gone"), undefined);
+});
+
+Deno.test("VAL-OPT-010b readAllValues is omitted without values, entries, or keys", () => {
+  const storage = setMethods(backing(), {
+    readAllKeys: undefined,
+    readAllValues: undefined,
+    readAllEntries: undefined,
+  });
+  const adapter = createExtendedStorage({ storage });
 
   assertStrictEquals(adapter.readAllValues, undefined);
 });
 
-Deno.test("VAL-OPT-007 readAllEntries yields only decoded entries and filters undefined", async () => {
+Deno.test("VAL-OPT-010c readAllValues prefers backing readAllValues over keys", async () => {
   const storage = backing();
-  const { entries } = await writeOptionalFixtures(storage);
-  setMethods(storage, { readAllEntries: () => entries });
-  const adapter = createExtendedStorage<unknown>({
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const calls = { keys: 0, values: 0 };
+  setMethods(storage, {
+    readAllKeys: () => {
+      calls.keys++;
+      return fixtures.keys;
+    },
+    readAllValues: () => {
+      calls.values++;
+      return fixtures.values;
+    },
+    readAllEntries: undefined,
+  });
+  const adapter = createExtendedStorage({
     storage,
-    codecs: [missingCodec("gone-codec")],
+    transforms: [transforms.rev, transforms.ttl],
   });
 
-  assert(adapter.readAllEntries);
-  assertEquals(await collectAsync(adapter.readAllEntries()), [
+  await collectAsync(adapter.readAllValues!());
+
+  assertEquals(calls, { keys: 0, values: 1 });
+});
+
+// ---------------------------------------------------------------------------
+// readAllEntries
+// ---------------------------------------------------------------------------
+
+Deno.test("VAL-OPT-011 readAllEntries from entries yields decoded live pairs and cleans up expired keys", async () => {
+  const storage = backing();
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  setMethods(storage, {
+    readAllKeys: undefined,
+    readAllValues: undefined,
+    readAllEntries: () => fixtures.entries,
+  });
+  const adapter = createExtendedStorage({
+    storage,
+    transforms: [transforms.rev, transforms.ttl],
+  });
+
+  assertEquals(await collectAsync(adapter.readAllEntries!()), [
     ["a", { value: 1 }],
     ["b", ["two"]],
   ]);
+  assertEquals(await storage.read("gone"), undefined);
 });
 
-Deno.test("VAL-OPT-008 readAllEntries is omitted without entries or key-read derivation", () => {
+Deno.test("VAL-OPT-012 readAllEntries from keys reads each key", async () => {
+  const storage = backing();
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  setMethods(storage, {
+    readAllKeys: () => fixtures.keys,
+    readAllValues: undefined,
+    readAllEntries: undefined,
+  });
+  const adapter = createExtendedStorage({
+    storage,
+    transforms: [transforms.rev, transforms.ttl],
+  });
+  const reads = readsOf(storage);
+
+  assertEquals(await collectAsync(adapter.readAllEntries!()), [
+    ["a", { value: 1 }],
+    ["b", ["two"]],
+  ]);
+  assertEquals(reads.count, 3);
+  assertEquals(await storage.read("gone"), undefined);
+});
+
+Deno.test("VAL-OPT-013 readAllEntries is omitted without entries or key-read derivation", () => {
   const storage = setMethods(backing(), {
     readAllKeys: undefined,
     readAllEntries: undefined,
-    readAllValues: () => [],
   });
-  const adapter = createExtendedStorage<unknown>({ storage });
+  const adapter = createExtendedStorage({ storage });
 
   assertStrictEquals(adapter.readAllEntries, undefined);
 });
 
-Deno.test("VAL-OPT-009 bulk methods are async-iterable when backing iterables are synchronous", async () => {
+// ---------------------------------------------------------------------------
+// Capability selection & iteration semantics
+// ---------------------------------------------------------------------------
+
+Deno.test("VAL-OPT-014 bulk methods are async-iterable when backing iterables are synchronous", async () => {
   const storage = backing();
-  const { entries, keys, values } = await writeOptionalFixtures(storage);
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
   setMethods(storage, {
-    readAllKeys: () => keys,
-    readAllValues: () => values,
-    readAllEntries: () => entries,
+    readAllKeys: () => fixtures.keys,
+    readAllValues: () => fixtures.values,
+    readAllEntries: () => fixtures.entries,
   });
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage({
     storage,
-    codecs: [missingCodec("gone-codec")],
+    transforms: [transforms.rev, transforms.ttl],
   });
 
-  assert(adapter.readAllKeys);
-  assert(adapter.readAllValues);
-  assert(adapter.readAllEntries);
-
-  assertEquals(await collectAsync(adapter.readAllKeys()), ["a", "b"]);
-  assertEquals(await collectAsync(adapter.readAllValues()), [
-    { value: 1 },
-    ["two"],
-  ]);
-  assertEquals(await collectAsync(adapter.readAllEntries()), [
-    ["a", { value: 1 }],
-    ["b", ["two"]],
-  ]);
+  for (
+    const iterable of [
+      adapter.readAllKeys!(),
+      adapter.readAllValues!(),
+      adapter.readAllEntries!(),
+    ]
+  ) {
+    assert(Symbol.asyncIterator in iterable);
+    assert(!(Symbol.iterator in iterable));
+  }
+  assertEquals(await collectAsync(adapter.readAllKeys!()), ["a", "b"]);
 });
 
-Deno.test("bulk methods prefer readAllEntries when backing exposes all bulk capabilities", async () => {
+Deno.test("VAL-OPT-015 bulk methods prefer readAllEntries when backing exposes all bulk capabilities", async () => {
   const storage = backing();
-  const { entries, keys, values } = await writeOptionalFixtures(storage);
-  let readAllKeysCalls = 0;
-  let readAllValuesCalls = 0;
-  let readAllEntriesCalls = 0;
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const calls = { keys: 0, values: 0, entries: 0 };
   setMethods(storage, {
     readAllKeys: () => {
-      readAllKeysCalls++;
-      return keys;
+      calls.keys++;
+      return fixtures.keys;
     },
     readAllValues: () => {
-      readAllValuesCalls++;
-      return values;
+      calls.values++;
+      return fixtures.values;
     },
     readAllEntries: () => {
-      readAllEntriesCalls++;
-      return entries;
+      calls.entries++;
+      return fixtures.entries;
     },
   });
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage({
     storage,
-    codecs: [missingCodec("gone-codec")],
+    transforms: [transforms.rev, transforms.ttl],
   });
 
-  assert(adapter.readAllKeys);
-  assert(adapter.readAllValues);
-  assert(adapter.readAllEntries);
+  await collectAsync(adapter.readAllKeys!());
+  await collectAsync(adapter.readAllValues!());
+  await collectAsync(adapter.readAllEntries!());
 
-  assertEquals(await collectAsync(adapter.readAllKeys()), ["a", "b"]);
-  assertEquals(readAllKeysCalls, 0);
-  assertEquals(readAllEntriesCalls, 1);
-
-  assertEquals(await collectAsync(adapter.readAllValues()), [
-    { value: 1 },
-    ["two"],
-  ]);
-  assertEquals(readAllValuesCalls, 0);
-  assertEquals(readAllEntriesCalls, 2);
-
-  assertEquals(await collectAsync(adapter.readAllEntries()), [
-    ["a", { value: 1 }],
-    ["b", ["two"]],
-  ]);
-  assertEquals(readAllKeysCalls, 0);
-  assertEquals(readAllValuesCalls, 0);
-  assertEquals(readAllEntriesCalls, 3);
+  assertEquals(calls, { keys: 0, values: 0, entries: 3 });
 });
 
-Deno.test("VAL-OPT-010 readAllKeys is exposed when backing has only readAllEntries", async () => {
+Deno.test("VAL-OPT-016 bulk iteration ignores cleanup delete failures", async () => {
   const storage = backing();
-  const { entries } = await writeOptionalFixtures(storage);
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
   setMethods(storage, {
-    readAllKeys: undefined,
-    readAllValues: undefined,
-    readAllEntries: () => entries,
+    readAllEntries: () => fixtures.entries,
+    delete: () => {
+      throw new Error("delete failed");
+    },
   });
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage({
     storage,
-    codecs: [missingCodec("gone-codec")],
+    transforms: [transforms.rev, transforms.ttl],
   });
 
-  assert(adapter.readAllKeys);
-  assertEquals(await collectAsync(adapter.readAllKeys()), ["a", "b"]);
-});
-
-Deno.test("VAL-OPT-011 readAllValues is exposed when backing has only readAllEntries", async () => {
-  const storage = backing();
-  const { entries } = await writeOptionalFixtures(storage);
-  setMethods(storage, {
-    readAllKeys: undefined,
-    readAllValues: undefined,
-    readAllEntries: () => entries,
-  });
-  const adapter = createExtendedStorage<unknown>({
-    storage,
-    codecs: [missingCodec("gone-codec")],
-  });
-
-  assert(adapter.readAllValues);
-  assertEquals(await collectAsync(adapter.readAllValues()), [
-    { value: 1 },
-    ["two"],
-  ]);
-});
-
-Deno.test("VAL-OPT-012 readAllEntries is exposed when backing has readAllKeys only", async () => {
-  const storage = backing();
-  const { keys } = await writeOptionalFixtures(storage);
-  setMethods(storage, {
-    readAllKeys: () => keys,
-    readAllValues: undefined,
-    readAllEntries: undefined,
-  });
-  const adapter = createExtendedStorage<unknown>({
-    storage,
-    codecs: [missingCodec("gone-codec")],
-  });
-
-  assert(adapter.readAllEntries);
-  assertEquals(await collectAsync(adapter.readAllEntries()), [
+  assertEquals(await collectAsync(adapter.readAllKeys!()), ["a", "b"]);
+  assertEquals(await collectAsync(adapter.readAllEntries!()), [
     ["a", { value: 1 }],
     ["b", ["two"]],
   ]);
 });
 
-Deno.test("VAL-OPT-013 bulk iteration ignores tombstone cleanup delete failures", async () => {
+Deno.test("VAL-OPT-017 bulk iteration is fail-fast on a corrupt entry", async () => {
   const storage = backing();
-  const { entries } = await writeOptionalFixtures(storage);
+  const transforms = fixtureTransforms();
+  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const corrupt = validEnvelope({ transforms: [record("ghost")] });
   setMethods(storage, {
-    readAllEntries: () => entries,
-    delete: () => Promise.reject(new Error("cleanup exploded")),
+    readAllEntries: () => [fixtures.entries[0], ["bad", corrupt]],
   });
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage({
     storage,
-    codecs: [missingCodec("gone-codec")],
+    transforms: [transforms.rev, transforms.ttl],
   });
 
-  assert(adapter.readAllKeys);
-  assert(adapter.readAllEntries);
-  assertEquals(await collectAsync(adapter.readAllKeys()), ["a", "b"]);
-  assertEquals(await collectAsync(adapter.readAllEntries()), [
-    ["a", { value: 1 }],
-    ["b", ["two"]],
-  ]);
+  const seen: string[] = [];
+  let failed: unknown;
+  try {
+    for await (const key of adapter.readAllKeys!()) seen.push(key);
+  } catch (error) {
+    failed = error;
+  }
+
+  assertEquals(seen, ["a"]);
+  assert(failed instanceof Error);
+  assert(failed.message.includes("ghost"));
 });

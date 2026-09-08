@@ -1,100 +1,137 @@
 import type { StorageAdapter } from "grammy";
 
-import { JsonValueCodec } from "./json-value-codec.ts";
-import { VALUE_CODEC_ID } from "./constants.ts";
+import {
+  bytesToText,
+  decodeBody,
+  deserializeValue,
+  encodeBody,
+  serializeValue,
+  textToBytes,
+} from "./body.ts";
+import {
+  RESERVED_TRANSFORM_KIND_PREFIX,
+  STORAGE_ENVELOPE_KIND,
+} from "./constants.ts";
+import {
+  assertValidEnvelope,
+  isPlainObject,
+  type StorageEnvelope,
+  type StorageTransformRecord,
+} from "./envelope.ts";
 import {
   EXTENDED_STORAGE_ERROR_CODES,
   ExtendedStorageError,
 } from "./errors.ts";
-import type { StorageEnvelopeCodec } from "./codec.ts";
-import { assertValidEnvelope, type StorageEnvelope } from "./envelope.ts";
+import type {
+  StorageReadOnlyTransform,
+  StorageTransform,
+} from "./transform.ts";
+import { PACKAGE_VERSION } from "./version.ts";
 
 export type CreateExtendedStorageOptions = {
+  /** The physical database adapter that reads and writes envelopes. */
   storage: StorageAdapter<StorageEnvelope>;
-  codecs?: readonly StorageEnvelopeCodec[];
-  maxDecodeDepth?: number;
+  /** Optional ordered list of body transforms applied on write. */
+  transforms?: readonly StorageTransform[];
+  /**
+   * Transforms registered only for reading; never applied on write. Use this
+   * to keep reading rows produced by a transform you have stopped using.
+   */
+  readOnlyTransforms?: readonly StorageReadOnlyTransform[];
 };
 
 type MaybeAsyncIterable<T> = Iterable<T> | AsyncIterable<T>;
 
-type StorageAdapterCapabilities = StorageAdapter<StorageEnvelope> & {
-  has?: (key: string) => boolean | Promise<boolean>;
-  readAllKeys?: () => MaybeAsyncIterable<string>;
-  readAllValues?: () => MaybeAsyncIterable<StorageEnvelope>;
-  readAllEntries?: () => MaybeAsyncIterable<[string, StorageEnvelope]>;
-};
-
-type InstalledEnvelopeCodec = {
-  readonly id: string;
-  readonly version: string;
-  readonly impl: StorageEnvelopeCodec;
+type ResolvedStep = {
+  readonly record: StorageTransformRecord;
+  readonly transform: StorageReadOnlyTransform;
 };
 
 export function createExtendedStorage<T>(
   options: CreateExtendedStorageOptions,
 ): StorageAdapter<T> {
-  const installed = installCodecs(options.codecs);
-  const maxDecodeDepth = resolveMaxDecodeDepth(
-    options.maxDecodeDepth,
-    installed.ordered.length,
+  const installed = installTransforms(
+    options.transforms,
+    options.readOnlyTransforms,
   );
-  const valueCodec = new JsonValueCodec<T>();
-  const storage = options.storage as StorageAdapterCapabilities;
+  const storage = options.storage;
 
-  async function decodeEnvelope(
-    envelope: StorageEnvelope,
-    keyToDeleteOnUndefined: string | undefined,
-  ): Promise<T | undefined> {
-    let current = envelope;
-    let userDecodeCount = 0;
+  async function cleanup(key: string | undefined): Promise<void> {
+    if (key === undefined) return;
+    try {
+      await storage.delete(key);
+    } catch {
+      // Best-effort cleanup: the entry was already determined to be
+      // logically absent, so a failed delete must not propagate.
+    }
+  }
 
-    for (;;) {
-      assertValidEnvelope(current);
+  /**
+   * Validates the envelope, resolves every recorded transform, and runs the
+   * expiry pass. Returns `undefined` when the entry is expired (after
+   * best-effort cleanup), otherwise the resolved chain for the body pass.
+   */
+  async function inspectEnvelope(
+    envelope: unknown,
+    key: string | undefined,
+  ): Promise<readonly ResolvedStep[] | undefined> {
+    assertValidEnvelope(envelope);
 
-      if (current.codec === valueCodec.codec) {
-        return valueCodec.decode(current);
-      }
-
-      if (userDecodeCount >= maxDecodeDepth) {
+    const chain: ResolvedStep[] = envelope.transforms.map((record) => {
+      const transform = installed.byKind.get(record.kind);
+      if (transform === undefined) {
         throw new ExtendedStorageError(
-          EXTENDED_STORAGE_ERROR_CODES.DECODE_DEPTH_EXCEEDED,
-          `Decode depth exceeded maxDecodeDepth (${maxDecodeDepth})`,
+          EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_TRANSFORM,
+          `Unknown storage transform kind: ${record.kind}`,
         );
       }
+      return { record, transform };
+    });
 
-      const codec = installed.byId.get(current.codec);
-      if (codec === undefined) {
-        throw new ExtendedStorageError(
-          EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_CODEC,
-          `Unknown storage envelope codec: ${current.codec}`,
-        );
-      }
-
-      const next = await codec.impl.decode(current);
-      userDecodeCount++;
-      if (next === undefined) {
-        if (keyToDeleteOnUndefined !== undefined) {
-          try {
-            await storage.delete(keyToDeleteOnUndefined);
-          } catch {
-            // Best-effort cleanup (spec section 10.4.6): the session was
-            // already determined to be logically absent, so a failed
-            // cleanup delete must not propagate.
-          }
-        }
+    for (const { record, transform } of chain) {
+      if (transform.isExpired === undefined) continue;
+      if (await transform.isExpired(record)) {
+        await cleanup(key);
         return undefined;
       }
-
-      current = next;
     }
+
+    return chain;
+  }
+
+  async function decodeChain(
+    envelope: StorageEnvelope,
+    chain: readonly ResolvedStep[],
+  ): Promise<T> {
+    let bytes = decodeBody(envelope.body, envelope.encoding);
+
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const { record, transform } = chain[i];
+      const next: unknown = await transform.decode(bytes, record);
+      if (!(next instanceof Uint8Array)) {
+        throw new ExtendedStorageError(
+          EXTENDED_STORAGE_ERROR_CODES.INVALID_TRANSFORM_OUTPUT,
+          `Storage transform "${record.kind}" decode must return a Uint8Array`,
+        );
+      }
+      bytes = next;
+    }
+
+    return deserializeValue<T>(bytesToText(bytes));
+  }
+
+  async function decodeEnvelope(
+    envelope: unknown,
+    key: string | undefined,
+  ): Promise<T | undefined> {
+    const chain = await inspectEnvelope(envelope, key);
+    if (chain === undefined) return undefined;
+    return await decodeChain(envelope as StorageEnvelope, chain);
   }
 
   async function read(key: string): Promise<T | undefined> {
     const envelope = await storage.read(key);
-    if (envelope === undefined) {
-      return undefined;
-    }
-
+    if (envelope === undefined) return undefined;
     return await decodeEnvelope(envelope, key);
   }
 
@@ -104,29 +141,68 @@ export function createExtendedStorage<T>(
       return;
     }
 
-    let envelope = valueCodec.encode(value);
-    assertValidEnvelope(envelope);
+    const text = serializeValue(value);
 
-    for (const codec of installed.ordered) {
-      envelope = await codec.impl.encode(envelope);
-      assertValidEnvelope(envelope);
-      assertEncodeOutputIdentity(codec, envelope);
+    if (installed.ordered.length === 0) {
+      await storage.write(key, {
+        kind: STORAGE_ENVELOPE_KIND,
+        version: PACKAGE_VERSION,
+        transforms: [],
+        encoding: "utf8",
+        body: text,
+      });
+      return;
     }
 
-    await storage.write(key, envelope);
+    let bytes = textToBytes(text);
+    const records: StorageTransformRecord[] = [];
+
+    for (const transform of installed.ordered) {
+      const output: unknown = await transform.encode(bytes);
+      if (!isPlainObject(output) || !(output.body instanceof Uint8Array)) {
+        throw new ExtendedStorageError(
+          EXTENDED_STORAGE_ERROR_CODES.INVALID_TRANSFORM_OUTPUT,
+          `Storage transform "${transform.kind}" encode must return { body: Uint8Array, meta? }`,
+        );
+      }
+      if (output.meta !== undefined && !isPlainObject(output.meta)) {
+        throw new ExtendedStorageError(
+          EXTENDED_STORAGE_ERROR_CODES.INVALID_TRANSFORM_OUTPUT,
+          `Storage transform "${transform.kind}" encode meta must be a plain object`,
+        );
+      }
+      records.push({
+        kind: transform.kind,
+        version: transform.version,
+        meta: output.meta ?? {},
+      });
+      bytes = output.body;
+    }
+
+    await storage.write(key, {
+      kind: STORAGE_ENVELOPE_KIND,
+      version: PACKAGE_VERSION,
+      transforms: records,
+      encoding: "base64",
+      body: encodeBody(bytes),
+    });
   }
 
   async function deleteKey(key: string): Promise<void> {
     await storage.delete(key);
   }
 
+  async function has(key: string): Promise<boolean> {
+    const envelope = await storage.read(key);
+    if (envelope === undefined) return false;
+    return (await inspectEnvelope(envelope, key)) !== undefined;
+  }
+
   async function* readAllKeysFromKeys(
     keys: MaybeAsyncIterable<string>,
   ): AsyncIterable<string> {
     for await (const key of keys) {
-      if ((await read(key)) !== undefined) {
-        yield key;
-      }
+      if (await has(key)) yield key;
     }
   }
 
@@ -134,9 +210,7 @@ export function createExtendedStorage<T>(
     entries: MaybeAsyncIterable<[string, StorageEnvelope]>,
   ): AsyncIterable<string> {
     for await (const [key, envelope] of entries) {
-      if ((await decodeEnvelope(envelope, key)) !== undefined) {
-        yield key;
-      }
+      if ((await inspectEnvelope(envelope, key)) !== undefined) yield key;
     }
   }
 
@@ -145,9 +219,7 @@ export function createExtendedStorage<T>(
   ): AsyncIterable<T> {
     for await (const envelope of values) {
       const value = await decodeEnvelope(envelope, undefined);
-      if (value !== undefined) {
-        yield value;
-      }
+      if (value !== undefined) yield value;
     }
   }
 
@@ -156,9 +228,15 @@ export function createExtendedStorage<T>(
   ): AsyncIterable<T> {
     for await (const [key, envelope] of entries) {
       const value = await decodeEnvelope(envelope, key);
-      if (value !== undefined) {
-        yield value;
-      }
+      if (value !== undefined) yield value;
+    }
+  }
+
+  async function* readAllValuesFromKeys(
+    keys: MaybeAsyncIterable<string>,
+  ): AsyncIterable<T> {
+    for await (const [, value] of readAllEntriesFromKeys(keys)) {
+      yield value;
     }
   }
 
@@ -167,9 +245,7 @@ export function createExtendedStorage<T>(
   ): AsyncIterable<[string, T]> {
     for await (const [key, envelope] of entries) {
       const value = await decodeEnvelope(envelope, key);
-      if (value !== undefined) {
-        yield [key, value];
-      }
+      if (value !== undefined) yield [key, value];
     }
   }
 
@@ -178,9 +254,7 @@ export function createExtendedStorage<T>(
   ): AsyncIterable<[string, T]> {
     for await (const key of keys) {
       const value = await read(key);
-      if (value !== undefined) {
-        yield [key, value];
-      }
+      if (value !== undefined) yield [key, value];
     }
   }
 
@@ -190,8 +264,7 @@ export function createExtendedStorage<T>(
     delete: deleteKey,
   };
 
-  adapter.has = async (key: string): Promise<boolean> =>
-    (await read(key)) !== undefined;
+  adapter.has = has;
 
   if (typeof storage.readAllEntries === "function") {
     adapter.readAllKeys = (): AsyncIterable<string> =>
@@ -207,6 +280,9 @@ export function createExtendedStorage<T>(
   } else if (typeof storage.readAllValues === "function") {
     adapter.readAllValues = (): AsyncIterable<T> =>
       readAllValuesFromValues(storage.readAllValues!());
+  } else if (typeof storage.readAllKeys === "function") {
+    adapter.readAllValues = (): AsyncIterable<T> =>
+      readAllValuesFromKeys(storage.readAllKeys!());
   }
 
   if (typeof storage.readAllEntries === "function") {
@@ -220,88 +296,41 @@ export function createExtendedStorage<T>(
   return adapter;
 }
 
-function resolveMaxDecodeDepth(
-  value: number | undefined,
-  codecCount: number,
-): number {
-  if (value === undefined) {
-    return codecCount + 16;
-  }
-
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new ExtendedStorageError(
-      EXTENDED_STORAGE_ERROR_CODES.INVALID_MAX_DECODE_DEPTH,
-      `Invalid maxDecodeDepth: expected a positive integer, got ${value}`,
-    );
-  }
-
-  return value;
-}
-
-function installCodecs(
-  codecs: readonly StorageEnvelopeCodec[] = [],
+function installTransforms(
+  transforms: readonly StorageTransform[] = [],
+  readOnlyTransforms: readonly StorageReadOnlyTransform[] = [],
 ): {
-  readonly ordered: readonly InstalledEnvelopeCodec[];
-  readonly byId: ReadonlyMap<string, InstalledEnvelopeCodec>;
+  readonly ordered: readonly StorageTransform[];
+  readonly byKind: ReadonlyMap<string, StorageReadOnlyTransform>;
 } {
-  const ordered: InstalledEnvelopeCodec[] = [];
-  const byId = new Map<string, InstalledEnvelopeCodec>();
+  const byKind = new Map<string, StorageReadOnlyTransform>();
 
-  for (const impl of codecs) {
-    const id = impl.codec;
+  for (const transform of [...transforms, ...readOnlyTransforms]) {
+    const kind = transform.kind;
 
-    if (id.length === 0) {
+    if (kind.length === 0) {
       throw new ExtendedStorageError(
-        EXTENDED_STORAGE_ERROR_CODES.EMPTY_CODEC_ID,
-        "Storage envelope codec id must be non-empty",
+        EXTENDED_STORAGE_ERROR_CODES.EMPTY_TRANSFORM_KIND,
+        "Storage transform kind must be non-empty",
       );
     }
 
-    if (id === VALUE_CODEC_ID || id.startsWith("grammy-extended-storage-")) {
+    if (kind.startsWith(RESERVED_TRANSFORM_KIND_PREFIX)) {
       throw new ExtendedStorageError(
-        EXTENDED_STORAGE_ERROR_CODES.RESERVED_CODEC_ID,
-        `Reserved storage envelope codec id: ${id}`,
+        EXTENDED_STORAGE_ERROR_CODES.RESERVED_TRANSFORM_KIND,
+        `Reserved storage transform kind: ${kind}`,
       );
     }
 
-    if (byId.has(id)) {
+    if (byKind.has(kind)) {
       throw new ExtendedStorageError(
-        EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_CODEC_ID,
-        `Duplicate storage envelope codec id: ${id}`,
+        EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_TRANSFORM_KIND,
+        `Duplicate storage transform kind: ${kind}`,
       );
     }
 
-    const installed: InstalledEnvelopeCodec = {
-      id,
-      version: impl.version,
-      impl,
-    };
-
-    ordered.push(installed);
-    byId.set(id, installed);
+    byKind.set(kind, transform);
   }
 
-  return { ordered, byId };
-}
-
-function assertEncodeOutputIdentity(
-  codec: InstalledEnvelopeCodec,
-  envelope: StorageEnvelope,
-): void {
-  const mismatchedFields: string[] = [];
-  if (envelope.codec !== codec.id) {
-    mismatchedFields.push("codec");
-  }
-  if (envelope.version !== codec.version) {
-    mismatchedFields.push("version");
-  }
-
-  if (mismatchedFields.length > 0) {
-    throw new ExtendedStorageError(
-      EXTENDED_STORAGE_ERROR_CODES.CODEC_IDENTITY_MISMATCH,
-      `Storage envelope codec "${codec.id}" encode output mismatched ${
-        mismatchedFields.join(" and ")
-      }`,
-    );
-  }
+  return { ordered: [...transforms], byKind };
 }
