@@ -8,7 +8,7 @@
   },
   "tasks": {
     "test": "deno test --allow-env --allow-import=cdn.jsdelivr.net,jsr.io,cdn.skypack.dev",
-    "check": "deno check --allow-import=cdn.jsdelivr.net,jsr.io,cdn.skypack.dev src/mod.ts test/",
+    "check": "deno check --allow-import=cdn.jsdelivr.net,jsr.io,cdn.skypack.dev src/mod.ts test/ examples/",
     "lint": "deno lint",
     "fmt:check": "deno fmt --check",
     "publish:dry": "deno publish --dry-run --allow-dirty"

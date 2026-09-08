@@ -81,49 +81,22 @@ export function spyTransform(
   return Object.assign(transform, { calls });
 }
 
+// The gzip and ttl transforms are the canonical worked examples in `examples/`.
+// Re-export thin wrappers here so the test suite exercises the same code the
+// README documents, and old call sites keep their (kind, ttlMs, now) signatures.
+import { gzip } from "../examples/gzip.ts";
+import { ttl } from "../examples/ttl.ts";
+
 export function ttlTransform(
   kind: string,
   ttlMs: number,
   now: () => number = Date.now,
 ): StorageTransform {
-  return {
-    kind,
-    version: "1.0.0",
-    encode(body) {
-      return { body, meta: { expiresAt: now() + ttlMs } };
-    },
-    decode(body) {
-      return body;
-    },
-    isExpired(record) {
-      const expiresAt = record.meta.expiresAt;
-      return typeof expiresAt === "number" && now() >= expiresAt;
-    },
-  };
-}
-
-async function pipeThrough(
-  bytes: Uint8Array,
-  stream: ReadableWritablePair<Uint8Array, BufferSource>,
-): Promise<Uint8Array> {
-  const source = new Blob([bytes as BlobPart]).stream().pipeThrough(stream);
-  return new Uint8Array(await new Response(source).arrayBuffer());
+  return ttl(ttlMs, kind, now);
 }
 
 export function gzipTransform(kind = "gzip"): StorageTransform {
-  return {
-    kind,
-    version: "1.0.0",
-    async encode(body) {
-      return {
-        body: await pipeThrough(body, new CompressionStream("gzip")),
-        meta: { rawLength: body.byteLength },
-      };
-    },
-    decode(body) {
-      return pipeThrough(body, new DecompressionStream("gzip"));
-    },
-  };
+  return gzip(kind);
 }
 
 export type ReadOnlySpy = StorageReadOnlyTransform & {

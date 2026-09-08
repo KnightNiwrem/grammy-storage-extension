@@ -48,43 +48,22 @@ to your install method (JSR once published, otherwise a Git URL or local path).
 ## Quick start
 
 You do not have to write a transform to use the wrapper. With an empty transform
-list it just wraps your session values in envelopes and stores them as-is.
+list it just wraps your session values in envelopes and stores them as-is:
 
 ```ts
-import { Bot, type Context, session, type SessionFlavor } from "grammy";
-import { MemorySessionStorage } from "grammy";
-import {
-  createExtendedStorage,
-  type StorageEnvelope,
-} from "@grammyjs/storage-extended";
-
-interface SessionData {
-  count: number;
-}
-type MyContext = Context & SessionFlavor<SessionData>;
-
-// The backing adapter stores StorageEnvelope values — swap MemorySessionStorage
-// for any grammY storage adapter (Redis, MongoDB, Deno KV, …).
-// MemorySessionStorage is for demonstration only: it keeps everything in
-// process memory and loses all contents when the process restarts. Use a
-// persistent adapter in production.
-const backing = new MemorySessionStorage<StorageEnvelope>();
-
 const storage = createExtendedStorage<SessionData>({
-  storage: backing,
+  storage: new MemorySessionStorage<StorageEnvelope>(), // any grammY adapter
   transforms: [], // no transforms yet: values are wrapped but otherwise unchanged
 });
 
-const bot = new Bot<MyContext>(""); // <-- your bot token
 bot.use(session({ initial: (): SessionData => ({ count: 0 }), storage }));
-
-bot.on("message", (ctx) => {
-  ctx.session.count++;
-  return ctx.reply(`Seen ${ctx.session.count} messages.`);
-});
-
-bot.start();
 ```
+
+The full, runnable program is in
+[`examples/quick-start.ts`](./examples/quick-start.ts). Swap
+`MemorySessionStorage` for any grammY storage adapter (Redis, MongoDB, Deno KV,
+…); it is for demonstration only and loses all contents when the process
+restarts, so use a persistent adapter in production.
 
 The type parameter on `createExtendedStorage<SessionData>` must match your
 session type; the returned adapter is a `StorageAdapter<SessionData>`.
@@ -102,46 +81,8 @@ entry as expired once that time passes. It is metadata-only — the body is neve
 rewritten:
 
 ```ts
-import { MemorySessionStorage } from "grammy";
-import {
-  createExtendedStorage,
-  type StorageEnvelope,
-  type StorageTransform,
-} from "@grammyjs/storage-extended";
-
-function ttl(ttlMilliseconds: number): StorageTransform {
-  if (!Number.isFinite(ttlMilliseconds) || ttlMilliseconds <= 0) {
-    throw new RangeError(
-      `ttl requires a positive duration, got ${ttlMilliseconds}`,
-    );
-  }
-  return {
-    kind: "example:ttl",
-    version: "1.0.0",
-    encode: (body) => ({
-      body,
-      meta: { expiresAt: Date.now() + ttlMilliseconds },
-    }),
-    decode: (body) => body,
-    // Reads the plaintext meta only; the body is never decoded for this check.
-    isExpired: (record) => {
-      const expiresAtMilliseconds = record.meta.expiresAt;
-      // Malformed stored metadata must not silently pass as a live entry.
-      if (!Number.isFinite(expiresAtMilliseconds)) {
-        throw new Error(
-          `${record.kind}: invalid meta.expiresAt ${
-            JSON.stringify(expiresAtMilliseconds)
-          }`,
-        );
-      }
-      return Date.now() >= (expiresAtMilliseconds as number);
-    },
-  };
-}
-
-const backing = new MemorySessionStorage<StorageEnvelope>();
 const storage = createExtendedStorage<{ count: number }>({
-  storage: backing,
+  storage: new MemorySessionStorage<StorageEnvelope>(),
   transforms: [ttl(60_000)],
 });
 
@@ -150,6 +91,11 @@ console.log(await storage.read("chat:1")); // { count: 1 }
 // ...more than 60s later, or after the clock passes expiresAt:
 console.log(await storage.read("chat:1")); // undefined (and the row is deleted)
 ```
+
+The `ttl()` transform used above is the complete, runnable
+[`examples/ttl.ts`](./examples/ttl.ts): it stamps `meta.expiresAt` on encode,
+leaves the body untouched, and exposes a cheap `isExpired` that reads only the
+plaintext meta (so `has` and `readAllKeys` never decode the body).
 
 ### Ordering
 
@@ -181,7 +127,7 @@ Suppose you have been writing rows with the
 new writes. Before, gzip is in `transforms`:
 
 ```ts
-import { gzip } from "./gzip.ts"; // the worked example below
+import { gzip } from "./examples/gzip.ts"; // the worked example below
 
 const storage = createExtendedStorage<SessionData>({
   storage: backing,
@@ -194,7 +140,7 @@ while new writes skip compression. The transform's `kind` must match the one in
 the stored rows, so reuse the same `gzip()`:
 
 ```ts
-import { gzip } from "./gzip.ts";
+import { gzip } from "./examples/gzip.ts";
 
 const storage = createExtendedStorage<SessionData>({
   storage: backing,
@@ -321,21 +267,13 @@ rules: [`spec.md` §7](./spec.md#7-transform-contract).
 
 ### Worked example: gzip compression
 
-A complete, runnable transform using the platform `CompressionStream`. It
-rejects unsupported record versions and validates the untrusted field it reads
-back (`record.meta.rawLength`) rather than trusting it blindly:
+[`examples/gzip.ts`](./examples/gzip.ts) is a complete, runnable transform using
+the platform `CompressionStream`. It shows the two things a body transform
+should do beyond the round trip: reject record versions its `decode` does not
+understand, and **validate** the untrusted field it reads back
+(`record.meta.rawLength`) rather than trusting it blindly. Its shape:
 
 ```ts
-import type { StorageTransform } from "@grammyjs/storage-extended";
-
-async function pipeThrough(
-  bytes: Uint8Array,
-  stream: ReadableWritablePair<Uint8Array, BufferSource>,
-): Promise<Uint8Array> {
-  const source = new Blob([bytes as BlobPart]).stream().pipeThrough(stream);
-  return new Uint8Array(await new Response(source).arrayBuffer());
-}
-
 export function gzip(kind = "example:gzip"): StorageTransform {
   return {
     kind,
@@ -347,34 +285,18 @@ export function gzip(kind = "example:gzip"): StorageTransform {
       };
     },
     async decode(body, record) {
-      // Reject record versions this decode does not understand.
-      if (record.version !== "1.0.0") {
-        throw new Error(
-          `${record.kind}: unsupported record version ${record.version}`,
-        );
-      }
-      const restored = await pipeThrough(body, new DecompressionStream("gzip"));
-      // Validate untrusted meta before trusting it (see spec.md §6, §7.4).
-      const expected = record.meta.rawLength;
-      if (
-        typeof expected !== "number" ||
-        !Number.isSafeInteger(expected) ||
-        expected < 0
-      ) {
-        throw new Error(
-          `${record.kind}: invalid meta.rawLength ${JSON.stringify(expected)}`,
-        );
-      }
-      if (restored.byteLength !== expected) {
-        throw new Error(
-          `${record.kind}: decoded ${restored.byteLength} bytes, expected ${expected}`,
-        );
-      }
-      return restored;
+      // Rejects unknown record.version, then validates record.meta.rawLength
+      // against the decoded byte length. See examples/gzip.ts for the checks.
+      // ...
     },
   };
 }
 ```
+
+The example transforms ([`examples/gzip.ts`](./examples/gzip.ts),
+[`examples/ttl.ts`](./examples/ttl.ts)) are exercised by the test suite
+(`test/examples.test.ts`), so the snippets above stay in step with code that
+actually runs.
 
 ### Testing and distribution
 
