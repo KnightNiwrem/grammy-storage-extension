@@ -57,7 +57,10 @@ async function writeOptionalFixtures(
   keys: string[];
   values: StorageEnvelope[];
 }> {
-  const writer = createExtendedStorage<unknown>({
+  // Two intentionally different live shapes prove the optional-method
+  // machinery is agnostic to the application value; the union names that
+  // domain explicitly instead of erasing it to `unknown`.
+  const writer = createExtendedStorage<{ value: number } | string[]>({
     storage,
     transforms: [transforms.rev, transforms.ttl],
   });

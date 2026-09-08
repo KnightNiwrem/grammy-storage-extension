@@ -33,25 +33,77 @@ const record = (
   ...overrides,
 });
 
+/** A representative session value paired with the key it is stored under. */
+type RoundtripCase<T> = {
+  readonly name: string;
+  readonly key: string;
+  readonly value: T;
+};
+
 // ---------------------------------------------------------------------------
 // examples/gzip.ts
 // ---------------------------------------------------------------------------
 
-Deno.test("EX-GZIP-001 roundtrips representative values and stamps meta.rawLength", async () => {
-  const storage = backing();
-  const adapter = createExtendedStorage<unknown>({
-    storage,
+Deno.test("EX-GZIP-001 roundtrips a representative value of each JSON shape", async () => {
+  // gzip roundtrips the body verbatim, so each case declares the concrete
+  // application type its adapter stores. A storage value need not be an object.
+  const objectCase: RoundtripCase<{ items: [number, { flag: boolean }] }> = {
+    name: "nested object",
+    key: "profile:nested",
+    value: { items: [1, { flag: true }] },
+  };
+  const arrayCase: RoundtripCase<Array<string | null>> = {
+    name: "array with null element",
+    key: "tags:mixed",
+    value: ["x", null],
+  };
+  const stringCase: RoundtripCase<string> = {
+    name: "plain string",
+    key: "message:greeting",
+    value: "hello",
+  };
+  const nullCase: RoundtripCase<null> = {
+    name: "null value",
+    key: "cleared:slot",
+    value: null,
+  };
+
+  const objectStorage = backing();
+  const objectAdapter = createExtendedStorage<
+    { items: [number, { flag: boolean }] }
+  >({ storage: objectStorage, transforms: [gzip()] });
+  await objectAdapter.write(objectCase.key, objectCase.value);
+  assertEquals(await objectAdapter.read(objectCase.key), objectCase.value);
+
+  const arrayStorage = backing();
+  const arrayAdapter = createExtendedStorage<Array<string | null>>({
+    storage: arrayStorage,
     transforms: [gzip()],
   });
-  const values = [{ a: [1, { b: true }] }, ["x", null], "hello", null];
+  await arrayAdapter.write(arrayCase.key, arrayCase.value);
+  assertEquals(await arrayAdapter.read(arrayCase.key), arrayCase.value);
 
-  for (const [index, value] of values.entries()) {
-    await adapter.write(`key-${index}`, value);
-    assertEquals(await adapter.read(`key-${index}`), value);
-  }
+  const nullStorage = backing();
+  const nullAdapter = createExtendedStorage<null>({
+    storage: nullStorage,
+    transforms: [gzip()],
+  });
+  await nullAdapter.write(nullCase.key, nullCase.value);
+  assertEquals(await nullAdapter.read(nullCase.key), nullCase.value);
 
-  const stored = await rawRead(storage, "key-2"); // "hello" -> JSON `"hello"`
+  // The string case also verifies the gzip metadata for its own known value,
+  // so the assertion references the same key and value used to write it.
+  const messageStorage = backing();
+  const messageAdapter = createExtendedStorage<string>({
+    storage: messageStorage,
+    transforms: [gzip()],
+  });
+  await messageAdapter.write(stringCase.key, stringCase.value);
+  assertEquals(await messageAdapter.read(stringCase.key), stringCase.value);
+
+  const stored = await rawRead(messageStorage, stringCase.key);
   assertEquals(stored.transforms.map((r) => r.kind), ["example:gzip"]);
+  // The JSON text of "hello" is '"hello"': seven UTF-8 bytes with the quotes.
   assertEquals(stored.transforms[0].meta, { rawLength: 7 });
 });
 
@@ -95,6 +147,10 @@ Deno.test("EX-GZIP-003 decode throws on a tampered meta.rawLength", async () => 
 // examples/ttl.ts
 // ---------------------------------------------------------------------------
 
+interface SessionData {
+  count: number;
+}
+
 Deno.test("EX-TTL-001 rejects a non-positive duration at construction", () => {
   assertThrows(() => ttl(0), RangeError, "positive duration");
   assertThrows(() => ttl(-1), RangeError, "positive duration");
@@ -103,53 +159,59 @@ Deno.test("EX-TTL-001 rejects a non-positive duration at construction", () => {
 
 Deno.test("EX-TTL-002 stamps meta.expiresAt and is metadata-only", async () => {
   const storage = backing();
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage<SessionData>({
     storage,
     transforms: [ttl(60_000, "example:ttl", () => 1_000)],
   });
+  const key = "chat:1";
+  const session: SessionData = { count: 1 };
 
-  await adapter.write("key", { count: 1 });
+  await adapter.write(key, session);
 
-  const stored = await rawRead(storage, "key");
+  const stored = await rawRead(storage, key);
   assertEquals(stored.transforms[0].meta, { expiresAt: 61_000 });
   // Body is untouched: reading it back yields the original value.
-  assertEquals(await adapter.read("key"), { count: 1 });
+  assertEquals(await adapter.read(key), session);
 });
 
 Deno.test("EX-TTL-003 an expired row reads back undefined and is deleted", async () => {
   const storage = backing();
   let now = 1_000;
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage<SessionData>({
     storage,
     transforms: [ttl(100, "example:ttl", () => now)],
   });
-  await adapter.write("key", { count: 1 });
+  const key = "chat:1";
+  const session: SessionData = { count: 1 };
+  await adapter.write(key, session);
 
-  assertEquals(await adapter.read("key"), { count: 1 }); // before expiry
+  assertEquals(await adapter.read(key), session); // before expiry
 
   now = 1_100; // expiresAt was 1_100; now >= expiresAt
-  assertEquals(await adapter.read("key"), undefined);
-  assertEquals(await storage.read("key"), undefined); // row swept from backing
+  assertEquals(await adapter.read(key), undefined);
+  assertEquals(await storage.read(key), undefined); // row swept from backing
 });
 
 Deno.test("EX-TTL-004 isExpired throws on malformed meta.expiresAt", async () => {
   const storage = backing();
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage<SessionData>({
     storage,
     transforms: [ttl(100, "example:ttl", () => 1_000)],
   });
-  await adapter.write("key", { count: 1 });
+  const key = "chat:1";
+  await adapter.write(key, { count: 1 });
 
-  // Rewrite the stored envelope with a non-finite expiry to simulate corruption.
-  const stored = await rawRead(storage, "key");
-  await storage.write("key", {
+  // The application value stays well-typed; only the stored envelope metadata
+  // is corrupted, simulating a non-finite expiry written by an earlier build.
+  const stored = await rawRead(storage, key);
+  await storage.write(key, {
     ...stored,
     transforms: [{ ...stored.transforms[0], meta: { expiresAt: "soon" } }],
   });
 
   await assertRejects(
     async () => {
-      await adapter.read("key");
+      await adapter.read(key);
     },
     Error,
     "invalid meta.expiresAt",
@@ -163,18 +225,17 @@ Deno.test("EX-TTL-004 isExpired throws on malformed meta.expiresAt", async () =>
 Deno.test("EX-CHAIN-001 gzip + ttl roundtrip on real grammY MemorySessionStorage", async () => {
   const storage = backing();
   let now = 1_000;
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage<SessionData>({
     storage,
     transforms: [gzip(), ttl(60_000, "example:ttl", () => now)],
   });
-  const values = [{ a: [1, { b: true }] }, ["x", null], "hello", null];
+  const key = "chat:1";
+  const session: SessionData = { count: 1 };
 
-  for (const [index, value] of values.entries()) {
-    await adapter.write(`key-${index}`, value);
-    assertEquals(await adapter.read(`key-${index}`), value);
-  }
+  await adapter.write(key, session);
+  assertEquals(await adapter.read(key), session);
 
-  const stored = await rawRead(storage, "key-0");
+  const stored = await rawRead(storage, key);
   assertEquals(stored.encoding, "base64");
   assertEquals(stored.transforms.map((r) => r.kind), [
     "example:gzip",
@@ -183,6 +244,6 @@ Deno.test("EX-CHAIN-001 gzip + ttl roundtrip on real grammY MemorySessionStorage
   assert(typeof stored.transforms[0].meta.rawLength === "number");
   assertEquals(stored.transforms[1].meta.expiresAt, 61_000);
 
-  now = 61_000; // everything written at t=1_000 expires at 61_000
-  assertEquals(await adapter.read("key-0"), undefined);
+  now = 61_000; // written at t=1_000, so it expires at 61_000
+  assertEquals(await adapter.read(key), undefined);
 });

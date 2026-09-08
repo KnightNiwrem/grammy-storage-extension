@@ -205,7 +205,7 @@ Deno.test("VAL-CONSTR-008 PACKAGE_VERSION matches the version in deno.json", () 
 
 Deno.test("VAL-BODY-001 zero-transform write produces a readable utf8 envelope", async () => {
   const storage = spyStorage(backing());
-  const adapter = createExtendedStorage({ storage });
+  const adapter = createExtendedStorage<{ a: number }>({ storage });
 
   await adapter.write("key", { a: 1 });
 
@@ -217,36 +217,47 @@ Deno.test("VAL-BODY-001 zero-transform write produces a readable utf8 envelope",
 
 Deno.test("VAL-BODY-002 read decodes a utf8 body with JSON.parse", async () => {
   const storage = backing();
-  const adapter = createExtendedStorage({ storage });
+  const adapter = createExtendedStorage<{ parsed: boolean }>({ storage });
   await storage.write("key", validEnvelope({ body: '{"parsed":true}' }));
 
   assertEquals(await adapter.read("key"), { parsed: true });
 });
 
 Deno.test("VAL-BODY-003 roundtrips JSON-compatible primitives, arrays, and objects", async () => {
-  const adapter = createExtendedStorage<unknown>({ storage: backing() });
-  const values: unknown[] = [
-    null,
-    true,
-    0,
-    -1.5,
-    "",
-    "héllo ✓",
-    [],
-    [1, "two", null, { three: 3 }],
-    {},
-    { nested: { deep: [{ x: 1 }] } },
+  // The domain under test is any JSON-serializable value, so the adapter's
+  // application type is exactly that union rather than an opaque `unknown`.
+  type JsonValue =
+    | null
+    | boolean
+    | number
+    | string
+    | JsonValue[]
+    | { [key: string]: JsonValue };
+
+  const cases: ReadonlyArray<{ key: string; value: JsonValue }> = [
+    { key: "null", value: null },
+    { key: "boolean", value: true },
+    { key: "integer", value: 0 },
+    { key: "negative-float", value: -1.5 },
+    { key: "empty-string", value: "" },
+    { key: "unicode-string", value: "héllo ✓" },
+    { key: "empty-array", value: [] },
+    { key: "heterogeneous-array", value: [1, "two", null, { three: 3 }] },
+    { key: "empty-object", value: {} },
+    { key: "nested-object", value: { nested: { deep: [{ x: 1 }] } } },
   ];
 
-  for (const [index, value] of values.entries()) {
-    await adapter.write(`key-${index}`, value);
-    assertEquals(await adapter.read(`key-${index}`), value);
+  const adapter = createExtendedStorage<JsonValue>({ storage: backing() });
+  for (const { key, value } of cases) {
+    await adapter.write(key, value);
+    assertEquals(await adapter.read(key), value, `roundtrip for ${key}`);
   }
 });
 
 Deno.test("VAL-BODY-004 top-level undefined write deletes via storage.delete and never writes", async () => {
   const storage = spyStorage(backing());
-  const adapter = createExtendedStorage<unknown>({ storage });
+  // The domain includes `undefined`, whose write is the delete path under test.
+  const adapter = createExtendedStorage<number | undefined>({ storage });
   await adapter.write("key", 1);
   storage.calls.writes.length = 0;
 
@@ -285,6 +296,8 @@ Deno.test("VAL-BODY-006 invalid UTF-8 body throws the native decoding error", as
 
 Deno.test("VAL-BODY-007 unserializable value throws and does not write", async () => {
   const storage = spyStorage(backing());
+  // Escape hatch: this boundary test feeds a value no valid session type could
+  // hold (a bigint is not JSON-serializable), so `unknown` is required here.
   const adapter = createExtendedStorage<unknown>({ storage });
 
   const error = await assertRejects(
@@ -300,6 +313,8 @@ Deno.test("VAL-BODY-007 unserializable value throws and does not write", async (
 
 Deno.test("VAL-BODY-008 value that stringifies to undefined throws a typed error", async () => {
   const storage = spyStorage(backing());
+  // Escape hatch: a function is not a valid session value, but the write path
+  // must still reject it, so this boundary test types the value as `unknown`.
   const adapter = createExtendedStorage<unknown>({ storage });
 
   const error = await assertRejects(
@@ -1103,22 +1118,25 @@ Deno.test("VAL-EXPORT-001 exposes the public package API surface", () => {
 // ---------------------------------------------------------------------------
 
 Deno.test("VAL-CROSS-001 gzip + ttl chain roundtrips on real grammY MemorySessionStorage", async () => {
+  interface Session {
+    items: [number, { flag: boolean }];
+  }
   const storage = backing();
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage<Session>({
     storage,
     transforms: [gzipTransform(), ttlTransform("ttl", 60_000)],
   });
-  const values = [{ a: [1, { b: true }] }, ["x", null], "hello", null];
+  const key = "session:1";
+  const session: Session = { items: [1, { flag: true }] };
 
-  for (const [index, value] of values.entries()) {
-    await adapter.write(`key-${index}`, value);
-    assertEquals(await adapter.read(`key-${index}`), value);
-  }
+  await adapter.write(key, session);
+  assertEquals(await adapter.read(key), session);
 
-  const stored = await rawRead(storage, "key-0");
+  const stored = await rawRead(storage, key);
   assertEquals(stored.encoding, "base64");
   assertEquals(stored.transforms.map((r) => r.kind), ["gzip", "ttl"]);
-  assertEquals(stored.transforms[0].meta, { rawLength: 20 });
+  // JSON text is '{"items":[1,{"flag":true}]}': 27 UTF-8 bytes.
+  assertEquals(stored.transforms[0].meta, { rawLength: 27 });
   assertEquals(typeof stored.transforms[1].meta.expiresAt, "number");
 });
 
@@ -1182,7 +1200,7 @@ Deno.test("VAL-CROSS-004 mixed sync and async transforms roundtrip", async () =>
 Deno.test("VAL-CROSS-005 expired ttl rows are invisible to has, readAllKeys and read, and are deleted", async () => {
   const storage = backing();
   let now = 1_000;
-  const adapter = createExtendedStorage<unknown>({
+  const adapter = createExtendedStorage<number>({
     storage,
     transforms: [gzipTransform(), ttlTransform("ttl", 100, () => now)],
   });
