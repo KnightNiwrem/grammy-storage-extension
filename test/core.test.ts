@@ -10,42 +10,41 @@ import { MemorySessionStorage, type StorageAdapter } from "grammy";
 import denoConfig from "../deno.json" with { type: "json" };
 import * as publicApi from "../src/mod.ts";
 import {
-  assertValidEnvelope,
+  assertValidSerializedEnvelope,
+  type BodyCodec,
+  type CodecRecord,
   createExtendedStorage,
   type CreateExtendedStorageOptions,
+  ENVELOPE_DISCRIMINATOR,
   EXTENDED_STORAGE_ERROR_CODES,
   ExtendedStorageError,
   PACKAGE_VERSION,
-  RESERVED_TRANSFORM_KIND_PREFIX,
-  STORAGE_ENVELOPE_KIND,
-  type StorageEnvelope,
-  type StorageTransform,
-  type StorageTransformRecord,
+  type SerializedEnvelope,
 } from "../src/mod.ts";
 import {
-  gzipTransform,
+  gzipCodec,
   readOnlySpy,
   record,
-  spyTransform,
-  ttlTransform,
-  validEnvelope,
+  spyCodec,
+  ttlCodec,
+  validSerializedEnvelope,
 } from "./helpers.ts";
 
-type SpyableStorage = StorageAdapter<StorageEnvelope> & {
+type SpyableStorage = StorageAdapter<SerializedEnvelope> & {
   read(
     key: string,
-  ): StorageEnvelope | undefined | Promise<StorageEnvelope | undefined>;
-  write(key: string, value: StorageEnvelope): void | Promise<void>;
+  ): SerializedEnvelope | undefined | Promise<SerializedEnvelope | undefined>;
+  write(key: string, value: SerializedEnvelope): void | Promise<void>;
   delete(key: string): void | Promise<void>;
 };
 
 type SpyCalls = {
-  writes: Array<{ key: string; value: StorageEnvelope }>;
+  writes: Array<{ key: string; value: SerializedEnvelope }>;
   deletes: string[];
 };
 
 function backing(): SpyableStorage {
-  return new MemorySessionStorage<StorageEnvelope>() as SpyableStorage;
+  return new MemorySessionStorage<SerializedEnvelope>() as SpyableStorage;
 }
 
 function spyStorage(
@@ -55,7 +54,7 @@ function spyStorage(
   const originalDelete = storage.delete.bind(storage);
   const calls: SpyCalls = { writes: [], deletes: [] };
 
-  storage.write = async (key: string, value: StorageEnvelope) => {
+  storage.write = async (key: string, value: SerializedEnvelope) => {
     calls.writes.push({ key, value });
     await originalWrite(key, value);
   };
@@ -78,7 +77,7 @@ async function rawWrite(
 async function rawRead(
   storage: SpyableStorage,
   key: string,
-): Promise<StorageEnvelope> {
+): Promise<SerializedEnvelope> {
   const envelope = await storage.read(key);
   if (envelope === undefined) {
     throw new Error(`Fixture key "${key}" missing from storage`);
@@ -95,7 +94,7 @@ const reversed = (text: string): Uint8Array => utf8.encode(text).reverse();
 // Construction
 // ---------------------------------------------------------------------------
 
-Deno.test("VAL-CONSTR-001 returns a usable StorageAdapter<T> with no transforms", async () => {
+Deno.test("VAL-CONSTR-001 returns a usable StorageAdapter<T> with no codecs", async () => {
   const storage = backing();
   const adapter = createExtendedStorage<{ count: number }>({ storage });
 
@@ -103,75 +102,80 @@ Deno.test("VAL-CONSTR-001 returns a usable StorageAdapter<T> with no transforms"
 
   assertEquals(await adapter.read("key"), { count: 1 });
   assertEquals(await rawRead(storage, "key"), {
-    kind: STORAGE_ENVELOPE_KIND,
+    discriminator: ENVELOPE_DISCRIMINATOR,
     version: PACKAGE_VERSION,
-    transforms: [],
+    codecs: [],
     encoding: "utf8",
     body: '{"count":1}',
   });
 });
 
-Deno.test("VAL-CONSTR-002 accepts an empty transforms array", async () => {
+Deno.test("VAL-CONSTR-002 accepts an empty codecs array", async () => {
   const adapter = createExtendedStorage<number>({
     storage: backing(),
-    transforms: [],
+    codecs: [],
   });
   await adapter.write("key", 1);
   assertEquals(await adapter.read("key"), 1);
 });
 
-Deno.test("VAL-CONSTR-003 rejects empty transform kinds", () => {
+Deno.test("VAL-CONSTR-003 rejects an empty codec id", () => {
   const error = assertThrows(
     () =>
       createExtendedStorage({
         storage: backing(),
-        transforms: [spyTransform("")],
+        codecs: [spyCodec("")],
       }),
     ExtendedStorageError,
   );
-  assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.EMPTY_TRANSFORM_KIND);
+  assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.INVALID_CODEC_ID);
 });
 
-Deno.test("VAL-CONSTR-004 rejects reserved transform kind prefix", () => {
+Deno.test("VAL-CONSTR-004 rejects a non-string codec id", () => {
+  // A length-only guard would crash on null/undefined and let a non-string id
+  // into the registry; the guard must reject any non-primitive-string value.
+  for (const badId of [undefined, null, 1, true, {}, [], Symbol("s")]) {
+    const error = assertThrows(
+      () =>
+        createExtendedStorage({
+          storage: backing(),
+          codecs: [{
+            id: badId as never,
+            version: "1.0.0",
+            encode: (b) => ({ body: b }),
+            decode: (b) => b,
+          }],
+        }),
+      ExtendedStorageError,
+    );
+    assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.INVALID_CODEC_ID);
+  }
+});
+
+Deno.test("VAL-CONSTR-005 rejects duplicate codec ids", () => {
   const error = assertThrows(
     () =>
       createExtendedStorage({
         storage: backing(),
-        transforms: [spyTransform(`${RESERVED_TRANSFORM_KIND_PREFIX}x`)],
-      }),
-    ExtendedStorageError,
-    RESERVED_TRANSFORM_KIND_PREFIX,
-  );
-  assertEquals(
-    error.code,
-    EXTENDED_STORAGE_ERROR_CODES.RESERVED_TRANSFORM_KIND,
-  );
-});
-
-Deno.test("VAL-CONSTR-005 rejects duplicate transform kinds", () => {
-  const error = assertThrows(
-    () =>
-      createExtendedStorage({
-        storage: backing(),
-        transforms: [spyTransform("dup"), spyTransform("dup")],
+        codecs: [spyCodec("dup"), spyCodec("dup")],
       }),
     ExtendedStorageError,
     "dup",
   );
   assertEquals(
     error.code,
-    EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_TRANSFORM_KIND,
+    EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_CODEC_ID,
   );
 });
 
-Deno.test("VAL-CONSTR-006 transforms are applied to writes in declaration order", async () => {
+Deno.test("VAL-CONSTR-006 codecs are applied to writes in declaration order", async () => {
   const storage = backing();
   const order: string[] = [];
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [
-      spyTransform("first", { onEncode: () => order.push("first") }),
-      spyTransform("second", { onEncode: () => order.push("second") }),
+    codecs: [
+      spyCodec("first", { onEncode: () => order.push("first") }),
+      spyCodec("second", { onEncode: () => order.push("second") }),
     ],
   });
 
@@ -179,21 +183,21 @@ Deno.test("VAL-CONSTR-006 transforms are applied to writes in declaration order"
 
   assertEquals(order, ["first", "second"]);
   assertEquals(
-    (await rawRead(storage, "key")).transforms.map((r) => r.kind),
+    (await rawRead(storage, "key")).codecs.map((r) => r.id),
     ["first", "second"],
   );
 });
 
-Deno.test("VAL-CONSTR-007 mutating the transforms array after construction does not affect writes", async () => {
+Deno.test("VAL-CONSTR-007 mutating the codecs array after construction does not affect writes", async () => {
   const storage = backing();
-  const transforms: StorageTransform[] = [spyTransform("first")];
-  const adapter = createExtendedStorage<number>({ storage, transforms });
+  const codecs: BodyCodec[] = [spyCodec("first")];
+  const adapter = createExtendedStorage<number>({ storage, codecs });
 
-  transforms.push(spyTransform("second"));
+  codecs.push(spyCodec("second"));
   await adapter.write("key", 1);
 
   assertEquals(
-    (await rawRead(storage, "key")).transforms.map((r) => r.kind),
+    (await rawRead(storage, "key")).codecs.map((r) => r.id),
     ["first"],
   );
 });
@@ -206,7 +210,7 @@ Deno.test("VAL-CONSTR-008 PACKAGE_VERSION matches the version in deno.json", () 
 // Body serialization
 // ---------------------------------------------------------------------------
 
-Deno.test("VAL-BODY-001 zero-transform write produces a readable utf8 envelope", async () => {
+Deno.test("VAL-BODY-001 zero-codec write produces a readable utf8 envelope", async () => {
   const storage = spyStorage(backing());
   const adapter = createExtendedStorage<{ a: number }>({ storage });
 
@@ -214,14 +218,17 @@ Deno.test("VAL-BODY-001 zero-transform write produces a readable utf8 envelope",
 
   assertEquals(storage.calls.writes, [{
     key: "key",
-    value: validEnvelope({ body: '{"a":1}' }),
+    value: validSerializedEnvelope({ body: '{"a":1}' }),
   }]);
 });
 
 Deno.test("VAL-BODY-002 read decodes a utf8 body with JSON.parse", async () => {
   const storage = backing();
   const adapter = createExtendedStorage<{ parsed: boolean }>({ storage });
-  await storage.write("key", validEnvelope({ body: '{"parsed":true}' }));
+  await storage.write(
+    "key",
+    validSerializedEnvelope({ body: '{"parsed":true}' }),
+  );
 
   assertEquals(await adapter.read("key"), { parsed: true });
 });
@@ -274,7 +281,7 @@ Deno.test("VAL-BODY-004 top-level undefined write deletes via storage.delete and
 Deno.test("VAL-BODY-005 unparseable JSON body throws the native parse error", async () => {
   const storage = backing();
   const adapter = createExtendedStorage({ storage });
-  await storage.write("key", validEnvelope({ body: "{not json" }));
+  await storage.write("key", validSerializedEnvelope({ body: "{not json" }));
 
   await assertRejects(async () => {
     await adapter.read("key");
@@ -286,7 +293,7 @@ Deno.test("VAL-BODY-006 invalid UTF-8 body throws the native decoding error", as
   const adapter = createExtendedStorage({ storage });
   await storage.write(
     "key",
-    validEnvelope({
+    validSerializedEnvelope({
       encoding: "base64",
       body: base64(new Uint8Array([0xff, 0xfe])),
     }),
@@ -330,12 +337,15 @@ Deno.test("VAL-BODY-008 value that stringifies to undefined throws a typed error
   assertEquals(storage.calls.writes, []);
 });
 
-Deno.test("VAL-BODY-009 base64 body with zero transforms is decoded by its encoding field", async () => {
+Deno.test("VAL-BODY-009 base64 body with zero codecs is decoded by its encoding field", async () => {
   const storage = backing();
   const adapter = createExtendedStorage<number[]>({ storage });
   await storage.write(
     "key",
-    validEnvelope({ encoding: "base64", body: base64(utf8.encode("[1,2]")) }),
+    validSerializedEnvelope({
+      encoding: "base64",
+      body: base64(utf8.encode("[1,2]")),
+    }),
   );
 
   assertEquals(await adapter.read("key"), [1, 2]);
@@ -347,7 +357,10 @@ Deno.test("VAL-BODY-010 invalid base64 body throws the native decoding error", a
   ) {
     const storage = backing();
     const adapter = createExtendedStorage({ storage });
-    await storage.write("key", validEnvelope({ encoding: "base64", body }));
+    await storage.write(
+      "key",
+      validSerializedEnvelope({ encoding: "base64", body }),
+    );
 
     await assertRejects(async () => {
       await adapter.read("key");
@@ -359,32 +372,32 @@ Deno.test("VAL-BODY-010 invalid base64 body throws the native decoding error", a
 // Write pipeline
 // ---------------------------------------------------------------------------
 
-Deno.test("VAL-WRITE-001 single transform records its identity, normalises meta, and base64-encodes the body", async () => {
+Deno.test("VAL-WRITE-001 single codec records its identity, normalises meta, and base64-encodes the body", async () => {
   const storage = backing();
   const adapter = createExtendedStorage<{ a: number }>({
     storage,
-    transforms: [spyTransform("rev", { version: "2.1.0", reverse: true })],
+    codecs: [spyCodec("rev", { version: "2.1.0", reverse: true })],
   });
 
   await adapter.write("key", { a: 1 });
 
   assertEquals(await rawRead(storage, "key"), {
-    kind: STORAGE_ENVELOPE_KIND,
+    discriminator: ENVELOPE_DISCRIMINATOR,
     version: PACKAGE_VERSION,
-    transforms: [{ kind: "rev", version: "2.1.0", meta: {} }],
+    codecs: [{ id: "rev", version: "2.1.0", meta: {} }],
     encoding: "base64",
     body: base64(reversed('{"a":1}')),
   });
 });
 
-Deno.test("VAL-WRITE-002 multiple transforms compose in declaration order", async () => {
+Deno.test("VAL-WRITE-002 multiple codecs compose in declaration order", async () => {
   const storage = backing();
   const seen: Record<string, Uint8Array> = {};
   const adapter = createExtendedStorage<string>({
     storage,
-    transforms: [
-      spyTransform("rev", { reverse: true, onEncode: (b) => seen.rev = b }),
-      spyTransform("id", { onEncode: (b) => seen.id = b }),
+    codecs: [
+      spyCodec("rev", { reverse: true, onEncode: (b) => seen.rev = b }),
+      spyCodec("id", { onEncode: (b) => seen.id = b }),
     ],
   });
 
@@ -393,23 +406,23 @@ Deno.test("VAL-WRITE-002 multiple transforms compose in declaration order", asyn
   assertEquals(seen.rev, utf8.encode('"ab"'));
   assertEquals(seen.id, reversed('"ab"'));
   assertEquals(
-    (await rawRead(storage, "key")).transforms.map((r) => r.kind),
+    (await rawRead(storage, "key")).codecs.map((r) => r.id),
     ["rev", "id"],
   );
   assertEquals(await adapter.read("key"), "ab");
 });
 
-Deno.test("VAL-WRITE-003 meta returned by encode is recorded on the transform entry", async () => {
+Deno.test("VAL-WRITE-003 meta returned by encode is recorded on the codec entry", async () => {
   const storage = backing();
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [spyTransform("tagged", { meta: { tag: "x", n: 2 } })],
+    codecs: [spyCodec("tagged", { meta: { tag: "x", n: 2 } })],
   });
 
   await adapter.write("key", 1);
 
-  assertEquals((await rawRead(storage, "key")).transforms, [
-    { kind: "tagged", version: "1.0.0", meta: { tag: "x", n: 2 } },
+  assertEquals((await rawRead(storage, "key")).codecs, [
+    { id: "tagged", version: "1.0.0", meta: { tag: "x", n: 2 } },
   ]);
 });
 
@@ -429,8 +442,8 @@ Deno.test("VAL-WRITE-004 invalid encode output throws before any storage mutatio
     const storage = spyStorage(backing());
     const adapter = createExtendedStorage<number>({
       storage,
-      transforms: [{
-        kind: "bad",
+      codecs: [{
+        id: "bad",
         version: "1.0.0",
         encode: () => output as never,
         decode: (b) => b,
@@ -446,7 +459,7 @@ Deno.test("VAL-WRITE-004 invalid encode output throws before any storage mutatio
     );
     assertEquals(
       error.code,
-      EXTENDED_STORAGE_ERROR_CODES.INVALID_TRANSFORM_OUTPUT,
+      EXTENDED_STORAGE_ERROR_CODES.INVALID_CODEC_OUTPUT,
     );
     assertEquals(storage.calls.writes, []);
   }
@@ -457,13 +470,13 @@ Deno.test("VAL-WRITE-005 async encode is supported and applied sequentially", as
   const order: string[] = [];
   const adapter = createExtendedStorage<string>({
     storage,
-    transforms: [
-      spyTransform("a", {
+    codecs: [
+      spyCodec("a", {
         encodeAsync: true,
         reverse: true,
         onEncode: () => order.push("a"),
       }),
-      spyTransform("b", { encodeAsync: true, onEncode: () => order.push("b") }),
+      spyCodec("b", { encodeAsync: true, onEncode: () => order.push("b") }),
     ],
   });
 
@@ -477,7 +490,7 @@ Deno.test("VAL-WRITE-006 write delegates exactly once to backing storage", async
   const storage = spyStorage(backing());
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [spyTransform("a"), spyTransform("b")],
+    codecs: [spyCodec("a"), spyCodec("b")],
   });
 
   await adapter.write("key", 1);
@@ -486,14 +499,14 @@ Deno.test("VAL-WRITE-006 write delegates exactly once to backing storage", async
   assertEquals(storage.calls.writes[0].key, "key");
 });
 
-Deno.test("VAL-WRITE-007 a transform failing mid-chain prevents any write", async () => {
+Deno.test("VAL-WRITE-007 a codec failing mid-chain prevents any write", async () => {
   const storage = spyStorage(backing());
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [
-      spyTransform("ok"),
+    codecs: [
+      spyCodec("ok"),
       {
-        kind: "boom",
+        id: "boom",
         version: "1.0.0",
         encode: () => {
           throw new Error("encode failed");
@@ -518,25 +531,25 @@ Deno.test("VAL-WRITE-007 a transform failing mid-chain prevents any write", asyn
 // ---------------------------------------------------------------------------
 
 Deno.test("VAL-READ-001 returns undefined for a missing backing entry without decoding", async () => {
-  const transform = spyTransform("a", { expired: false });
+  const codec = spyCodec("a", { expired: false });
   const adapter = createExtendedStorage({
     storage: backing(),
-    transforms: [transform],
+    codecs: [codec],
   });
 
   assertEquals(await adapter.read("missing"), undefined);
-  assertEquals(transform.calls, { encode: 0, decode: 0, isExpired: 0 });
+  assertEquals(codec.calls, { encode: 0, decode: 0, isExpired: 0 });
 });
 
-Deno.test("VAL-READ-002 decode walks the recorded transforms in reverse order", async () => {
+Deno.test("VAL-READ-002 decode walks the recorded codecs in reverse order", async () => {
   const storage = backing();
   const order: string[] = [];
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [
-      spyTransform("a", { onDecode: () => order.push("a") }),
-      spyTransform("b", { onDecode: () => order.push("b") }),
-      spyTransform("c", { onDecode: () => order.push("c") }),
+    codecs: [
+      spyCodec("a", { onDecode: () => order.push("a") }),
+      spyCodec("b", { onDecode: () => order.push("b") }),
+      spyCodec("c", { onDecode: () => order.push("c") }),
     ],
   });
   await adapter.write("key", 1);
@@ -547,15 +560,15 @@ Deno.test("VAL-READ-002 decode walks the recorded transforms in reverse order", 
 
 Deno.test("VAL-READ-003 read order follows the record, not declaration order", async () => {
   const storage = backing();
-  const a = spyTransform("a", { reverse: true });
-  const b = spyTransform("b");
+  const a = spyCodec("a", { reverse: true });
+  const b = spyCodec("b");
   const writer = createExtendedStorage<{ swapped: boolean }>({
     storage,
-    transforms: [a, b],
+    codecs: [a, b],
   });
   const reader = createExtendedStorage<{ swapped: boolean }>({
     storage,
-    transforms: [b, a],
+    codecs: [b, a],
   });
 
   await writer.write("key", { swapped: true });
@@ -563,12 +576,12 @@ Deno.test("VAL-READ-003 read order follows the record, not declaration order", a
   assertEquals(await reader.read("key"), { swapped: true });
 });
 
-Deno.test("VAL-READ-004 unknown transform kind throws with the kind in the message", async () => {
+Deno.test("VAL-READ-004 unknown codec id throws with the id in the message", async () => {
   const storage = backing();
   const adapter = createExtendedStorage({ storage });
   await storage.write(
     "key",
-    validEnvelope({ transforms: [record("ghost")] }),
+    validSerializedEnvelope({ codecs: [record("ghost")] }),
   );
 
   const error = await assertRejects(
@@ -578,13 +591,13 @@ Deno.test("VAL-READ-004 unknown transform kind throws with the kind in the messa
     ExtendedStorageError,
     "ghost",
   );
-  assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_TRANSFORM);
+  assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_CODEC);
 });
 
 Deno.test("VAL-READ-005 malformed backing envelope throws", async () => {
   const storage = backing();
   const adapter = createExtendedStorage({ storage });
-  await rawWrite(storage, "key", { transforms: 42 });
+  await rawWrite(storage, "key", { codecs: 42 });
 
   const error = await assertRejects(
     async () => {
@@ -601,8 +614,8 @@ Deno.test("VAL-READ-006 decode returning a non-Uint8Array throws", async () => {
     const storage = spyStorage(backing());
     const adapter = createExtendedStorage<number>({
       storage,
-      transforms: [{
-        kind: "bad",
+      codecs: [{
+        id: "bad",
         version: "1.0.0",
         encode: (b) => ({ body: b }),
         decode: () => output as never,
@@ -620,7 +633,7 @@ Deno.test("VAL-READ-006 decode returning a non-Uint8Array throws", async () => {
     );
     assertEquals(
       error.code,
-      EXTENDED_STORAGE_ERROR_CODES.INVALID_TRANSFORM_OUTPUT,
+      EXTENDED_STORAGE_ERROR_CODES.INVALID_CODEC_OUTPUT,
     );
     assertEquals(storage.calls.deletes, []);
   }
@@ -629,7 +642,7 @@ Deno.test("VAL-READ-006 decode returning a non-Uint8Array throws", async () => {
 Deno.test("VAL-READ-007 async decode is supported", async () => {
   const adapter = createExtendedStorage<number[]>({
     storage: backing(),
-    transforms: [spyTransform("a", { decodeAsync: true, reverse: true })],
+    codecs: [spyCodec("a", { decodeAsync: true, reverse: true })],
   });
   await adapter.write("key", [1, 2, 3]);
 
@@ -640,8 +653,8 @@ Deno.test("VAL-READ-008 errors thrown by decode propagate without deleting", asy
   const storage = spyStorage(backing());
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [{
-      kind: "boom",
+    codecs: [{
+      id: "boom",
       version: "1.0.0",
       encode: (b) => ({ body: b }),
       decode: () => {
@@ -665,24 +678,24 @@ Deno.test("VAL-READ-008 errors thrown by decode propagate without deleting", asy
 
 Deno.test("VAL-READ-009 decode receives the stored record, including historical version and meta", async () => {
   const storage = backing();
-  let received: StorageTransformRecord | undefined;
+  let received: CodecRecord | undefined;
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [
-      spyTransform("a", { version: "2.0.0", onDecode: (_, r) => received = r }),
+    codecs: [
+      spyCodec("a", { version: "2.0.0", onDecode: (_, r) => received = r }),
     ],
   });
   await storage.write(
     "key",
-    validEnvelope({
-      transforms: [record("a", { version: "1.0.0", meta: { legacy: true } })],
+    validSerializedEnvelope({
+      codecs: [record("a", { version: "1.0.0", meta: { legacy: true } })],
       body: "7",
     }),
   );
 
   assertEquals(await adapter.read("key"), 7);
   assertEquals(received, {
-    kind: "a",
+    id: "a",
     version: "1.0.0",
     meta: { legacy: true },
   });
@@ -694,10 +707,10 @@ Deno.test("VAL-READ-009 decode receives the stored record, including historical 
 
 Deno.test("VAL-EXPIRE-001 expired entry reads as undefined, is deleted once, and is never decoded", async () => {
   const storage = spyStorage(backing());
-  const transform = spyTransform("ttl", { expired: true });
+  const codec = spyCodec("ttl", { expired: true });
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [transform],
+    codecs: [codec],
   });
   await adapter.write("key", 1);
   storage.calls.deletes.length = 0;
@@ -705,19 +718,19 @@ Deno.test("VAL-EXPIRE-001 expired entry reads as undefined, is deleted once, and
   assertEquals(await adapter.read("key"), undefined);
 
   assertEquals(storage.calls.deletes, ["key"]);
-  assertEquals(transform.calls.decode, 0);
-  assertEquals(transform.calls.isExpired, 1);
+  assertEquals(codec.calls.decode, 0);
+  assertEquals(codec.calls.isExpired, 1);
   assertEquals(await storage.read("key"), undefined);
 });
 
 Deno.test("VAL-EXPIRE-002 isExpired receives its own record with meta", async () => {
   const storage = backing();
-  let received: StorageTransformRecord | undefined;
+  let received: CodecRecord | undefined;
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [
-      spyTransform("other", { meta: { other: true } }),
-      spyTransform("ttl", {
+    codecs: [
+      spyCodec("other", { meta: { other: true } }),
+      spyCodec("ttl", {
         meta: { expiresAt: 5 },
         expired: (r) => {
           received = r;
@@ -730,7 +743,7 @@ Deno.test("VAL-EXPIRE-002 isExpired receives its own record with meta", async ()
 
   assertEquals(await adapter.read("key"), 1);
   assertEquals(received, {
-    kind: "ttl",
+    id: "ttl",
     version: "1.0.0",
     meta: { expiresAt: 5 },
   });
@@ -739,13 +752,13 @@ Deno.test("VAL-EXPIRE-002 isExpired receives its own record with meta", async ()
 Deno.test("VAL-EXPIRE-003 checks run in recorded order and short-circuit on the first true", async () => {
   const storage = backing();
   const order: string[] = [];
-  const first = spyTransform("first", {
+  const first = spyCodec("first", {
     expired: () => {
       order.push("first");
       return true;
     },
   });
-  const second = spyTransform("second", {
+  const second = spyCodec("second", {
     expired: () => {
       order.push("second");
       return false;
@@ -753,7 +766,7 @@ Deno.test("VAL-EXPIRE-003 checks run in recorded order and short-circuit on the 
   });
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [first, second],
+    codecs: [first, second],
   });
   await adapter.write("key", 1);
 
@@ -762,14 +775,14 @@ Deno.test("VAL-EXPIRE-003 checks run in recorded order and short-circuit on the 
   assertEquals(second.calls.isExpired, 0);
 });
 
-Deno.test("VAL-EXPIRE-004 any transform reporting expiry wins", async () => {
+Deno.test("VAL-EXPIRE-004 any codec reporting expiry wins", async () => {
   const storage = backing();
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [
-      spyTransform("alive", { expired: false }),
-      spyTransform("plain"),
-      spyTransform("dead", { expired: true }),
+    codecs: [
+      spyCodec("alive", { expired: false }),
+      spyCodec("plain"),
+      spyCodec("dead", { expired: true }),
     ],
   });
   await adapter.write("key", 1);
@@ -782,8 +795,8 @@ Deno.test("VAL-EXPIRE-005 a throwing isExpired propagates and does not delete", 
   const storage = spyStorage(backing());
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [
-      spyTransform("boom", {
+    codecs: [
+      spyCodec("boom", {
         expired: () => {
           throw new Error("check failed");
         },
@@ -803,13 +816,13 @@ Deno.test("VAL-EXPIRE-005 a throwing isExpired propagates and does not delete", 
   assertEquals(storage.calls.deletes, []);
 });
 
-Deno.test("VAL-EXPIRE-006 transforms without isExpired are skipped and live entries decode normally", async () => {
+Deno.test("VAL-EXPIRE-006 codecs without isExpired are skipped and live entries decode normally", async () => {
   const storage = spyStorage(backing());
-  const plain = spyTransform("plain", { reverse: true });
-  const alive = spyTransform("alive", { expired: false });
+  const plain = spyCodec("plain", { reverse: true });
+  const alive = spyCodec("alive", { expired: false });
   const adapter = createExtendedStorage<{ live: boolean }>({
     storage,
-    transforms: [plain, alive],
+    codecs: [plain, alive],
   });
   await adapter.write("key", { live: true });
   storage.calls.deletes.length = 0;
@@ -824,7 +837,7 @@ Deno.test("VAL-EXPIRE-007 cleanup delete failure does not propagate", async () =
   const storage = backing();
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [spyTransform("ttl", { expired: true })],
+    codecs: [spyCodec("ttl", { expired: true })],
   });
   await adapter.write("key", 1);
   storage.delete = () => {
@@ -838,8 +851,8 @@ Deno.test("VAL-EXPIRE-008 async isExpired is supported", async () => {
   const storage = backing();
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [{
-      kind: "ttl",
+    codecs: [{
+      id: "ttl",
       version: "1.0.0",
       encode: (b) => ({ body: b }),
       decode: (b) => b,
@@ -852,13 +865,13 @@ Deno.test("VAL-EXPIRE-008 async isExpired is supported", async () => {
   assertEquals(await storage.read("key"), undefined);
 });
 
-Deno.test("VAL-EXPIRE-009 unknown transform kinds are rejected before any expiry check runs", async () => {
+Deno.test("VAL-EXPIRE-009 unknown codec ids are rejected before any expiry check runs", async () => {
   const storage = spyStorage(backing());
-  const ttl = spyTransform("ttl", { expired: true });
-  const adapter = createExtendedStorage({ storage, transforms: [ttl] });
+  const ttl = spyCodec("ttl", { expired: true });
+  const adapter = createExtendedStorage({ storage, codecs: [ttl] });
   await storage.write(
     "key",
-    validEnvelope({ transforms: [record("ttl"), record("ghost")] }),
+    validSerializedEnvelope({ codecs: [record("ttl"), record("ghost")] }),
   );
 
   const error = await assertRejects(
@@ -868,115 +881,108 @@ Deno.test("VAL-EXPIRE-009 unknown transform kinds are rejected before any expiry
     ExtendedStorageError,
     "ghost",
   );
-  assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_TRANSFORM);
+  assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_CODEC);
   assertEquals(ttl.calls.isExpired, 0);
   assertEquals(storage.calls.deletes, []);
 });
 
 // ---------------------------------------------------------------------------
-// Read-only transforms
+// Read-only codecs
 // ---------------------------------------------------------------------------
 
-Deno.test("VAL-RO-001 read-only transforms are validated like write transforms", () => {
-  for (
-    const [readOnly, code] of [
-      [readOnlySpy(""), EXTENDED_STORAGE_ERROR_CODES.EMPTY_TRANSFORM_KIND],
-      [
-        readOnlySpy(`${RESERVED_TRANSFORM_KIND_PREFIX}legacy`),
-        EXTENDED_STORAGE_ERROR_CODES.RESERVED_TRANSFORM_KIND,
-      ],
-    ] as const
-  ) {
+Deno.test("VAL-RO-001 decoders are validated like write codecs", () => {
+  const badIds: readonly unknown[] = ["", undefined, null, 1, {}];
+  for (const badId of badIds) {
     const error = assertThrows(
       () =>
         createExtendedStorage({
           storage: backing(),
-          readOnlyTransforms: [readOnly],
+          decoders: [{ id: badId as never, decode: (b) => b }],
         }),
       ExtendedStorageError,
     );
-    assertEquals(error.code, code);
+    assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.INVALID_CODEC_ID);
   }
 });
 
-Deno.test("VAL-RO-002 a kind registered in both lists is rejected as a duplicate", () => {
+Deno.test("VAL-RO-002 an id registered in both lists is rejected as a duplicate", () => {
   const error = assertThrows(
     () =>
       createExtendedStorage({
         storage: backing(),
-        transforms: [spyTransform("dup")],
-        readOnlyTransforms: [readOnlySpy("dup")],
+        codecs: [spyCodec("dup")],
+        decoders: [readOnlySpy("dup")],
       }),
     ExtendedStorageError,
     "dup",
   );
   assertEquals(
     error.code,
-    EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_TRANSFORM_KIND,
+    EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_CODEC_ID,
   );
 });
 
-Deno.test("VAL-RO-003 read-only transforms are never applied on write", async () => {
+Deno.test("VAL-RO-003 read-only codecs are never applied on write", async () => {
   const storage = backing();
-  const full = spyTransform("full", { expired: false });
+  const full = spyCodec("full", { expired: false });
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [spyTransform("active")],
-    readOnlyTransforms: [readOnlySpy("legacy"), full],
+    codecs: [spyCodec("active")],
+    decoders: [readOnlySpy("legacy"), full],
   });
 
   await adapter.write("key", 1);
 
   assertEquals(
-    (await rawRead(storage, "key")).transforms.map((r) => r.kind),
+    (await rawRead(storage, "key")).codecs.map((r) => r.id),
     ["active"],
   );
   assertEquals(full.calls.encode, 0);
 });
 
-Deno.test("VAL-RO-004 rows produced by a retired transform stay readable and are rewritten without it", async () => {
+Deno.test("VAL-RO-004 rows produced by a retired codec stay readable and are rewritten without it", async () => {
   const storage = backing();
-  const keep = spyTransform("keep");
-  const retired = spyTransform("retired", { reverse: true, meta: { v: 1 } });
+  const keep = spyCodec("keep");
+  const retired = spyCodec("retired", { reverse: true, meta: { v: 1 } });
   const oldAdapter = createExtendedStorage<{ migrated: boolean }>({
     storage,
-    transforms: [keep, retired],
+    codecs: [keep, retired],
   });
   await oldAdapter.write("key", { migrated: false });
 
-  let seen: StorageTransformRecord | undefined;
+  let seen: CodecRecord | undefined;
   const legacy = readOnlySpy("retired", {
     reverse: true,
     onDecode: (_, r) => seen = r,
   });
   const newAdapter = createExtendedStorage<{ migrated: boolean }>({
     storage,
-    transforms: [keep],
-    readOnlyTransforms: [legacy],
+    codecs: [keep],
+    decoders: [legacy],
   });
 
   assertEquals(await newAdapter.read("key"), { migrated: false });
   assertEquals(legacy.calls.decode, 1);
-  assertEquals(seen, { kind: "retired", version: "1.0.0", meta: { v: 1 } });
+  assertEquals(seen, { id: "retired", version: "1.0.0", meta: { v: 1 } });
 
   await newAdapter.write("key", { migrated: true });
   assertEquals(
-    (await rawRead(storage, "key")).transforms.map((r) => r.kind),
+    (await rawRead(storage, "key")).codecs.map((r) => r.id),
     ["keep"],
   );
 
   const finalAdapter = createExtendedStorage<{ migrated: boolean }>({
     storage,
-    transforms: [keep],
+    codecs: [keep],
   });
   assertEquals(await finalAdapter.read("key"), { migrated: true });
 });
 
-Deno.test("VAL-RO-005 isExpired on a read-only transform expires the row for read and has", async () => {
+Deno.test("VAL-RO-005 isExpired on a read-only codec expires the row for read and has", async () => {
   const storage = spyStorage(backing());
   const writer = createExtendedStorage<number>({
     storage,
-    transforms: [spyTransform("ttl", { meta: { dead: true } })],
+    codecs: [spyCodec("ttl", { meta: { dead: true } })],
   });
   await writer.write("a", 1);
   await writer.write("b", 2);
@@ -985,7 +991,7 @@ Deno.test("VAL-RO-005 isExpired on a read-only transform expires the row for rea
   const legacy = readOnlySpy("ttl", { expired: (r) => r.meta.dead === true });
   const reader = createExtendedStorage<number>({
     storage,
-    readOnlyTransforms: [legacy],
+    decoders: [legacy],
   });
 
   assertEquals(await reader.read("a"), undefined);
@@ -998,20 +1004,20 @@ Deno.test("VAL-RO-005 isExpired on a read-only transform expires the row for rea
 // Deletion
 // ---------------------------------------------------------------------------
 
-Deno.test("VAL-DEL-001 delete delegates directly to backing storage without transforms", async () => {
+Deno.test("VAL-DEL-001 delete delegates directly to backing storage without codecs", async () => {
   const storage = spyStorage(backing());
-  const transform = spyTransform("a", { expired: false });
+  const codec = spyCodec("a", { expired: false });
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [transform],
+    codecs: [codec],
   });
   await adapter.write("key", 1);
 
   await adapter.delete("key");
 
   assertEquals(storage.calls.deletes, ["key"]);
-  assertEquals(transform.calls.decode, 0);
-  assertEquals(transform.calls.isExpired, 0);
+  assertEquals(codec.calls.decode, 0);
+  assertEquals(codec.calls.isExpired, 0);
   assertEquals(await storage.read("key"), undefined);
 });
 
@@ -1021,7 +1027,7 @@ Deno.test("VAL-DEL-001 delete delegates directly to backing storage without tran
 
 function assertInvalidEnvelope(value: unknown, message?: string): void {
   const error = assertThrows(
-    () => assertValidEnvelope(value),
+    () => assertValidSerializedEnvelope(value),
     ExtendedStorageError,
     message,
   );
@@ -1034,31 +1040,40 @@ Deno.test("VAL-ENV-001 rejects non-object values", () => {
   }
 });
 
-Deno.test("VAL-ENV-002 rejects wrong kind", () => {
-  assertInvalidEnvelope({ ...validEnvelope(), kind: "other" }, "kind");
-  assertInvalidEnvelope({ ...validEnvelope(), kind: undefined }, "kind");
+Deno.test("VAL-ENV-002 rejects wrong discriminator", () => {
+  assertInvalidEnvelope(
+    { ...validSerializedEnvelope(), discriminator: "other" },
+    "discriminator",
+  );
+  assertInvalidEnvelope(
+    { ...validSerializedEnvelope(), discriminator: undefined },
+    "discriminator",
+  );
 });
 
 Deno.test("VAL-ENV-003 rejects non-string version", () => {
-  assertInvalidEnvelope({ ...validEnvelope(), version: 1 }, "version");
+  assertInvalidEnvelope(
+    { ...validSerializedEnvelope(), version: 1 },
+    "version",
+  );
 });
 
-Deno.test("VAL-ENV-004 rejects transforms that are not an array", () => {
-  for (const transforms of [undefined, null, {}, "a"]) {
+Deno.test("VAL-ENV-004 rejects codecs that are not an array", () => {
+  for (const codecs of [undefined, null, {}, "a"]) {
     assertInvalidEnvelope(
-      { ...validEnvelope(), transforms },
-      "transforms",
+      { ...validSerializedEnvelope(), codecs },
+      "codecs",
     );
   }
 });
 
-Deno.test("VAL-ENV-005 rejects malformed transform records", () => {
+Deno.test("VAL-ENV-005 rejects malformed codec records", () => {
   const cases: Array<[unknown, string]> = [
-    [null, "transform at index 0"],
-    [[], "transform at index 0"],
-    ["a", "transform at index 0"],
-    [{ ...record("a"), kind: "" }, "kind at index 0"],
-    [{ ...record("a"), kind: 1 }, "kind at index 0"],
+    [null, "codec at index 0"],
+    [[], "codec at index 0"],
+    ["a", "codec at index 0"],
+    [{ ...record("a"), id: "" }, "id at index 0"],
+    [{ ...record("a"), id: 1 }, "id at index 0"],
     [{ ...record("a"), version: 1 }, "version at index 0"],
     [{ ...record("a"), meta: undefined }, "meta at index 0"],
     [{ ...record("a"), meta: null }, "meta at index 0"],
@@ -1066,33 +1081,39 @@ Deno.test("VAL-ENV-005 rejects malformed transform records", () => {
     [{ ...record("a"), meta: "m" }, "meta at index 0"],
   ];
   for (const [bad, message] of cases) {
-    assertInvalidEnvelope({ ...validEnvelope(), transforms: [bad] }, message);
+    assertInvalidEnvelope(
+      { ...validSerializedEnvelope(), codecs: [bad] },
+      message,
+    );
   }
   assertInvalidEnvelope(
-    { ...validEnvelope(), transforms: [record("a"), null] },
-    "transform at index 1",
+    { ...validSerializedEnvelope(), codecs: [record("a"), null] },
+    "codec at index 1",
   );
 });
 
 Deno.test("VAL-ENV-006 rejects unknown encodings", () => {
   for (const encoding of [undefined, "hex", "UTF8", 1]) {
-    assertInvalidEnvelope({ ...validEnvelope(), encoding }, "encoding");
+    assertInvalidEnvelope(
+      { ...validSerializedEnvelope(), encoding },
+      "encoding",
+    );
   }
 });
 
 Deno.test("VAL-ENV-007 rejects non-string body", () => {
   for (const body of [undefined, null, 1, new Uint8Array()]) {
-    assertInvalidEnvelope({ ...validEnvelope(), body }, "body");
+    assertInvalidEnvelope({ ...validSerializedEnvelope(), body }, "body");
   }
 });
 
 Deno.test("VAL-ENV-008 accepts valid envelopes and ignores extra properties", () => {
-  assertValidEnvelope(validEnvelope());
-  assertValidEnvelope(validEnvelope({
+  assertValidSerializedEnvelope(validSerializedEnvelope());
+  assertValidSerializedEnvelope(validSerializedEnvelope({
     encoding: "base64",
-    transforms: [record("a"), record("b", { meta: { n: 1 } })],
+    codecs: [record("a"), record("b", { meta: { n: 1 } })],
   }));
-  assertValidEnvelope({ ...validEnvelope(), extra: true });
+  assertValidSerializedEnvelope({ ...validSerializedEnvelope(), extra: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -1104,30 +1125,24 @@ Deno.test("VAL-EXPORT-001 exposes the public package API surface", () => {
   assert(options.storage);
 
   assertEquals(Object.keys(publicApi).sort(), [
+    "ENVELOPE_DISCRIMINATOR",
     "EXTENDED_STORAGE_ERROR_CODES",
     "ExtendedStorageError",
     "PACKAGE_VERSION",
-    "RESERVED_TRANSFORM_KIND_PREFIX",
-    "STORAGE_ENVELOPE_KIND",
-    "assertValidEnvelope",
+    "assertValidSerializedEnvelope",
     "createExtendedStorage",
   ]);
   assertEquals(publicApi.EXTENDED_STORAGE_ERROR_CODES, {
-    EMPTY_TRANSFORM_KIND: "ERR_EMPTY_TRANSFORM_KIND",
-    RESERVED_TRANSFORM_KIND: "ERR_RESERVED_TRANSFORM_KIND",
-    DUPLICATE_TRANSFORM_KIND: "ERR_DUPLICATE_TRANSFORM_KIND",
+    INVALID_CODEC_ID: "ERR_INVALID_CODEC_ID",
+    DUPLICATE_CODEC_ID: "ERR_DUPLICATE_CODEC_ID",
     VALUE_SERIALIZATION: "ERR_VALUE_SERIALIZATION",
     INVALID_ENVELOPE: "ERR_INVALID_ENVELOPE",
-    INVALID_TRANSFORM_OUTPUT: "ERR_INVALID_TRANSFORM_OUTPUT",
-    UNKNOWN_TRANSFORM: "ERR_UNKNOWN_TRANSFORM",
+    INVALID_CODEC_OUTPUT: "ERR_INVALID_CODEC_OUTPUT",
+    UNKNOWN_CODEC: "ERR_UNKNOWN_CODEC",
   });
   assertStrictEquals(
-    publicApi.STORAGE_ENVELOPE_KIND,
-    "grammy-extended-storage-envelope",
-  );
-  assertStrictEquals(
-    publicApi.RESERVED_TRANSFORM_KIND_PREFIX,
-    "grammy-extended-storage-",
+    publicApi.ENVELOPE_DISCRIMINATOR,
+    "grammy-storage-extension",
   );
 });
 
@@ -1142,7 +1157,7 @@ Deno.test("VAL-CROSS-001 gzip + ttl chain roundtrips on real grammY MemorySessio
   const storage = backing();
   const adapter = createExtendedStorage<Session>({
     storage,
-    transforms: [gzipTransform(), ttlTransform("ttl", 60_000)],
+    codecs: [gzipCodec(), ttlCodec("ttl", 60_000)],
   });
   const key = "session:1";
   const session: Session = { items: [1, { flag: true }] };
@@ -1152,23 +1167,23 @@ Deno.test("VAL-CROSS-001 gzip + ttl chain roundtrips on real grammY MemorySessio
 
   const stored = await rawRead(storage, key);
   assertEquals(stored.encoding, "base64");
-  assertEquals(stored.transforms.map((r) => r.kind), ["gzip", "ttl"]);
+  assertEquals(stored.codecs.map((r) => r.id), ["gzip", "ttl"]);
   // JSON text is '{"items":[1,{"flag":true}]}': 27 UTF-8 bytes.
-  assertEquals(stored.transforms[0].meta, { rawLength: 27 });
-  assertEquals(typeof stored.transforms[1].meta.expiresAt, "number");
+  assertEquals(stored.codecs[0].meta, { rawLength: 27 });
+  assertEquals(typeof stored.codecs[1].meta.expiresAt, "number");
 });
 
-Deno.test("VAL-CROSS-002 adding an unused transform does not break reads of pre-existing data", async () => {
+Deno.test("VAL-CROSS-002 adding an unused codec does not break reads of pre-existing data", async () => {
   const storage = backing();
-  const a = spyTransform("a", { reverse: true });
-  const b = spyTransform("b", { expired: true });
+  const a = spyCodec("a", { reverse: true });
+  const b = spyCodec("b", { expired: true });
   const writer = createExtendedStorage<{ persisted: boolean }>({
     storage,
-    transforms: [a],
+    codecs: [a],
   });
   const reader = createExtendedStorage<{ persisted: boolean }>({
     storage,
-    transforms: [a, b],
+    codecs: [a, b],
   });
 
   await writer.write("key", { persisted: true });
@@ -1177,17 +1192,17 @@ Deno.test("VAL-CROSS-002 adding an unused transform does not break reads of pre-
   assertEquals(b.calls, { encode: 0, decode: 0, isExpired: 0 });
 });
 
-Deno.test("VAL-CROSS-003 read fails informatively when a required transform is missing", async () => {
+Deno.test("VAL-CROSS-003 read fails informatively when a required codec is missing", async () => {
   const storage = backing();
-  const a = spyTransform("a");
-  const b = spyTransform("b");
+  const a = spyCodec("a");
+  const b = spyCodec("b");
   const writer = createExtendedStorage<{ persisted: boolean }>({
     storage,
-    transforms: [a, b],
+    codecs: [a, b],
   });
   const reader = createExtendedStorage<{ persisted: boolean }>({
     storage,
-    transforms: [a],
+    codecs: [a],
   });
 
   await writer.write("key", { persisted: true });
@@ -1199,29 +1214,29 @@ Deno.test("VAL-CROSS-003 read fails informatively when a required transform is m
     ExtendedStorageError,
     "b",
   );
-  assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_TRANSFORM);
+  assertEquals(error.code, EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_CODEC);
 });
 
-Deno.test("VAL-CROSS-004 mixed sync and async transforms roundtrip", async () => {
+Deno.test("VAL-CROSS-004 mixed sync and async codecs roundtrip", async () => {
   for (
-    const transforms of [
+    const codecs of [
       [
-        spyTransform("sync-a", { reverse: true }),
-        spyTransform("async-b", { encodeAsync: true, decodeAsync: true }),
+        spyCodec("sync-a", { reverse: true }),
+        spyCodec("async-b", { encodeAsync: true, decodeAsync: true }),
       ],
       [
-        spyTransform("async-a", {
+        spyCodec("async-a", {
           encodeAsync: true,
           decodeAsync: true,
           reverse: true,
         }),
-        spyTransform("sync-b"),
+        spyCodec("sync-b"),
       ],
     ]
   ) {
     const adapter = createExtendedStorage<{ mixed: boolean }>({
       storage: backing(),
-      transforms,
+      codecs,
     });
 
     await adapter.write("key", { mixed: true });
@@ -1235,7 +1250,7 @@ Deno.test("VAL-CROSS-005 expired ttl rows are invisible to has, readAllKeys and 
   let now = 1_000;
   const adapter = createExtendedStorage<number>({
     storage,
-    transforms: [gzipTransform(), ttlTransform("ttl", 100, () => now)],
+    codecs: [gzipCodec(), ttlCodec("ttl", 100, () => now)],
   });
   await adapter.write("fresh", 1);
   now = 1_050;

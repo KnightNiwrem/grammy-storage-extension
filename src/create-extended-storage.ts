@@ -2,58 +2,50 @@ import type { StorageAdapter } from "grammy";
 
 import {
   bytesToText,
-  decodeBody,
   deserializeValue,
-  encodeBody,
   serializeValue,
   textToBytes,
 } from "./body.ts";
+import { ENVELOPE_DISCRIMINATOR } from "./constants.ts";
 import {
-  RESERVED_TRANSFORM_KIND_PREFIX,
-  STORAGE_ENVELOPE_KIND,
-} from "./constants.ts";
-import {
-  assertValidEnvelope,
+  assertValidSerializedEnvelope,
+  type CodecRecord,
+  deserializeEnvelope,
+  type Envelope,
   isPlainObject,
-  type StorageEnvelope,
-  type StorageTransformRecord,
+  type SerializedEnvelope,
+  serializeEnvelope,
 } from "./envelope.ts";
 import {
   EXTENDED_STORAGE_ERROR_CODES,
   ExtendedStorageError,
 } from "./errors.ts";
-import type {
-  StorageReadOnlyTransform,
-  StorageTransform,
-} from "./transform.ts";
+import type { BodyCodec, BodyDecoder } from "./codec.ts";
 import { PACKAGE_VERSION } from "./version.ts";
 
 export type CreateExtendedStorageOptions = {
   /** The physical database adapter that reads and writes envelopes. */
-  storage: StorageAdapter<StorageEnvelope>;
-  /** Optional ordered list of body transforms applied on write. */
-  transforms?: readonly StorageTransform[];
+  storage: StorageAdapter<SerializedEnvelope>;
+  /** Optional ordered list of body codecs applied on write. */
+  codecs?: readonly BodyCodec[];
   /**
-   * Transforms registered only for reading; never applied on write. Use this
-   * to keep reading rows produced by a transform you have stopped using.
+   * Codecs registered only for reading; never applied on write. Use this to
+   * keep reading rows produced by a codec you have stopped using.
    */
-  readOnlyTransforms?: readonly StorageReadOnlyTransform[];
+  decoders?: readonly BodyDecoder[];
 };
 
 type MaybeAsyncIterable<T> = Iterable<T> | AsyncIterable<T>;
 
 type ResolvedStep = {
-  readonly record: StorageTransformRecord;
-  readonly transform: StorageReadOnlyTransform;
+  readonly record: CodecRecord;
+  readonly codec: BodyDecoder;
 };
 
 export function createExtendedStorage<T>(
   options: CreateExtendedStorageOptions,
 ): StorageAdapter<T> {
-  const installed = installTransforms(
-    options.transforms,
-    options.readOnlyTransforms,
-  );
+  const installed = installCodecs(options.codecs, options.decoders);
   const storage = options.storage;
 
   async function cleanup(key: string | undefined): Promise<void> {
@@ -67,7 +59,7 @@ export function createExtendedStorage<T>(
   }
 
   /**
-   * Validates the envelope, resolves every recorded transform, and runs the
+   * Validates the envelope, resolves every recorded codec, and runs the
    * expiry pass. Returns `undefined` when the entry is expired (after
    * best-effort cleanup), otherwise the resolved chain for the body pass.
    */
@@ -75,22 +67,22 @@ export function createExtendedStorage<T>(
     envelope: unknown,
     key: string | undefined,
   ): Promise<readonly ResolvedStep[] | undefined> {
-    assertValidEnvelope(envelope);
+    assertValidSerializedEnvelope(envelope);
 
-    const chain: ResolvedStep[] = envelope.transforms.map((record) => {
-      const transform = installed.byKind.get(record.kind);
-      if (transform === undefined) {
+    const chain: ResolvedStep[] = envelope.codecs.map((record) => {
+      const codec = installed.byId.get(record.id);
+      if (codec === undefined) {
         throw new ExtendedStorageError(
-          EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_TRANSFORM,
-          `Unknown storage transform kind: ${record.kind}`,
+          EXTENDED_STORAGE_ERROR_CODES.UNKNOWN_CODEC,
+          `Unknown storage codec id: ${record.id}`,
         );
       }
-      return { record, transform };
+      return { record, codec };
     });
 
-    for (const { record, transform } of chain) {
-      if (transform.isExpired === undefined) continue;
-      if (await transform.isExpired(record)) {
+    for (const { record, codec } of chain) {
+      if (codec.isExpired === undefined) continue;
+      if (await codec.isExpired(record)) {
         await cleanup(key);
         return undefined;
       }
@@ -100,24 +92,26 @@ export function createExtendedStorage<T>(
   }
 
   async function decodeChain(
-    envelope: StorageEnvelope,
+    serialized: SerializedEnvelope,
     chain: readonly ResolvedStep[],
   ): Promise<T> {
-    let bytes = decodeBody(envelope.body, envelope.encoding);
+    // The body pass has begun: reconstruct the internal working envelope
+    // (spec §10) and advance its body through the reverse decode chain.
+    let envelope = deserializeEnvelope(serialized);
 
     for (let i = chain.length - 1; i >= 0; i--) {
-      const { record, transform } = chain[i];
-      const next: unknown = await transform.decode(bytes, record);
+      const { record, codec } = chain[i];
+      const next: unknown = await codec.decode(envelope.body, record);
       if (!(next instanceof Uint8Array)) {
         throw new ExtendedStorageError(
-          EXTENDED_STORAGE_ERROR_CODES.INVALID_TRANSFORM_OUTPUT,
-          `Storage transform "${record.kind}" decode must return a Uint8Array`,
+          EXTENDED_STORAGE_ERROR_CODES.INVALID_CODEC_OUTPUT,
+          `Storage codec "${record.id}" decode must return a Uint8Array`,
         );
       }
-      bytes = next;
+      envelope = { ...envelope, body: next };
     }
 
-    return deserializeValue<T>(bytesToText(bytes));
+    return deserializeValue<T>(bytesToText(envelope.body));
   }
 
   async function decodeEnvelope(
@@ -126,7 +120,7 @@ export function createExtendedStorage<T>(
   ): Promise<T | undefined> {
     const chain = await inspectEnvelope(envelope, key);
     if (chain === undefined) return undefined;
-    return await decodeChain(envelope as StorageEnvelope, chain);
+    return await decodeChain(envelope as SerializedEnvelope, chain);
   }
 
   async function read(key: string): Promise<T | undefined> {
@@ -145,47 +139,52 @@ export function createExtendedStorage<T>(
 
     if (installed.ordered.length === 0) {
       await storage.write(key, {
-        kind: STORAGE_ENVELOPE_KIND,
+        discriminator: ENVELOPE_DISCRIMINATOR,
         version: PACKAGE_VERSION,
-        transforms: [],
+        codecs: [],
         encoding: "utf8",
         body: text,
       });
       return;
     }
 
-    let bytes = textToBytes(text);
-    const records: StorageTransformRecord[] = [];
+    // Assemble the internal working envelope, then advance it one codec at a
+    // time: the adapter owns each Envelope -> Envelope transition (spec §1, §9),
+    // replacing the body with the codec's output and appending its record.
+    let envelope: Envelope = {
+      discriminator: ENVELOPE_DISCRIMINATOR,
+      version: PACKAGE_VERSION,
+      codecs: [],
+      body: textToBytes(text),
+    };
 
-    for (const transform of installed.ordered) {
-      const output: unknown = await transform.encode(bytes);
+    for (const codec of installed.ordered) {
+      const output: unknown = await codec.encode(envelope.body);
       if (!isPlainObject(output) || !(output.body instanceof Uint8Array)) {
         throw new ExtendedStorageError(
-          EXTENDED_STORAGE_ERROR_CODES.INVALID_TRANSFORM_OUTPUT,
-          `Storage transform "${transform.kind}" encode must return { body: Uint8Array, meta? }`,
+          EXTENDED_STORAGE_ERROR_CODES.INVALID_CODEC_OUTPUT,
+          `Storage codec "${codec.id}" encode must return { body: Uint8Array, meta? }`,
         );
       }
       if (output.meta !== undefined && !isPlainObject(output.meta)) {
         throw new ExtendedStorageError(
-          EXTENDED_STORAGE_ERROR_CODES.INVALID_TRANSFORM_OUTPUT,
-          `Storage transform "${transform.kind}" encode meta must be a plain object`,
+          EXTENDED_STORAGE_ERROR_CODES.INVALID_CODEC_OUTPUT,
+          `Storage codec "${codec.id}" encode meta must be a plain object`,
         );
       }
-      records.push({
-        kind: transform.kind,
-        version: transform.version,
+      const record: CodecRecord = {
+        id: codec.id,
+        version: codec.version,
         meta: output.meta ?? {},
-      });
-      bytes = output.body;
+      };
+      envelope = {
+        ...envelope,
+        codecs: [...envelope.codecs, record],
+        body: output.body,
+      };
     }
 
-    await storage.write(key, {
-      kind: STORAGE_ENVELOPE_KIND,
-      version: PACKAGE_VERSION,
-      transforms: records,
-      encoding: "base64",
-      body: encodeBody(bytes),
-    });
+    await storage.write(key, serializeEnvelope(envelope, "base64"));
   }
 
   async function deleteKey(key: string): Promise<void> {
@@ -207,7 +206,7 @@ export function createExtendedStorage<T>(
   }
 
   async function* readAllKeysFromEntries(
-    entries: MaybeAsyncIterable<[string, StorageEnvelope]>,
+    entries: MaybeAsyncIterable<[string, SerializedEnvelope]>,
   ): AsyncIterable<string> {
     for await (const [key, envelope] of entries) {
       if ((await inspectEnvelope(envelope, key)) !== undefined) yield key;
@@ -215,7 +214,7 @@ export function createExtendedStorage<T>(
   }
 
   async function* readAllValuesFromValues(
-    values: MaybeAsyncIterable<StorageEnvelope>,
+    values: MaybeAsyncIterable<SerializedEnvelope>,
   ): AsyncIterable<T> {
     for await (const envelope of values) {
       const value = await decodeEnvelope(envelope, undefined);
@@ -224,7 +223,7 @@ export function createExtendedStorage<T>(
   }
 
   async function* readAllValuesFromEntries(
-    entries: MaybeAsyncIterable<[string, StorageEnvelope]>,
+    entries: MaybeAsyncIterable<[string, SerializedEnvelope]>,
   ): AsyncIterable<T> {
     for await (const [key, envelope] of entries) {
       const value = await decodeEnvelope(envelope, key);
@@ -241,7 +240,7 @@ export function createExtendedStorage<T>(
   }
 
   async function* readAllEntriesFromEntries(
-    entries: MaybeAsyncIterable<[string, StorageEnvelope]>,
+    entries: MaybeAsyncIterable<[string, SerializedEnvelope]>,
   ): AsyncIterable<[string, T]> {
     for await (const [key, envelope] of entries) {
       const value = await decodeEnvelope(envelope, key);
@@ -296,41 +295,34 @@ export function createExtendedStorage<T>(
   return adapter;
 }
 
-function installTransforms(
-  transforms: readonly StorageTransform[] = [],
-  readOnlyTransforms: readonly StorageReadOnlyTransform[] = [],
+function installCodecs(
+  codecs: readonly BodyCodec[] = [],
+  decoders: readonly BodyDecoder[] = [],
 ): {
-  readonly ordered: readonly StorageTransform[];
-  readonly byKind: ReadonlyMap<string, StorageReadOnlyTransform>;
+  readonly ordered: readonly BodyCodec[];
+  readonly byId: ReadonlyMap<string, BodyDecoder>;
 } {
-  const byKind = new Map<string, StorageReadOnlyTransform>();
+  const byId = new Map<string, BodyDecoder>();
 
-  for (const transform of [...transforms, ...readOnlyTransforms]) {
-    const kind = transform.kind;
+  for (const codec of [...codecs, ...decoders]) {
+    const id: unknown = codec.id;
 
-    if (kind.length === 0) {
+    if (typeof id !== "string" || id.length === 0) {
       throw new ExtendedStorageError(
-        EXTENDED_STORAGE_ERROR_CODES.EMPTY_TRANSFORM_KIND,
-        "Storage transform kind must be non-empty",
+        EXTENDED_STORAGE_ERROR_CODES.INVALID_CODEC_ID,
+        "Storage codec id must be a non-empty string",
       );
     }
 
-    if (kind.startsWith(RESERVED_TRANSFORM_KIND_PREFIX)) {
+    if (byId.has(id)) {
       throw new ExtendedStorageError(
-        EXTENDED_STORAGE_ERROR_CODES.RESERVED_TRANSFORM_KIND,
-        `Reserved storage transform kind: ${kind}`,
+        EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_CODEC_ID,
+        `Duplicate storage codec id: ${id}`,
       );
     }
 
-    if (byKind.has(kind)) {
-      throw new ExtendedStorageError(
-        EXTENDED_STORAGE_ERROR_CODES.DUPLICATE_TRANSFORM_KIND,
-        `Duplicate storage transform kind: ${kind}`,
-      );
-    }
-
-    byKind.set(kind, transform);
+    byId.set(id, codec);
   }
 
-  return { ordered: [...transforms], byKind };
+  return { ordered: [...codecs], byId };
 }

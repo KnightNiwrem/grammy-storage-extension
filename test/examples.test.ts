@@ -2,21 +2,21 @@ import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
 import { MemorySessionStorage } from "grammy";
 
 import {
+  type CodecRecord,
   createExtendedStorage,
-  type StorageEnvelope,
-  type StorageTransformRecord,
+  type SerializedEnvelope,
 } from "../src/mod.ts";
 import { gzip } from "../examples/gzip.ts";
 import { ttl } from "../examples/ttl.ts";
 
-function backing(): MemorySessionStorage<StorageEnvelope> {
-  return new MemorySessionStorage<StorageEnvelope>();
+function backing(): MemorySessionStorage<SerializedEnvelope> {
+  return new MemorySessionStorage<SerializedEnvelope>();
 }
 
 async function rawRead(
-  storage: MemorySessionStorage<StorageEnvelope>,
+  storage: MemorySessionStorage<SerializedEnvelope>,
   key: string,
-): Promise<StorageEnvelope> {
+): Promise<SerializedEnvelope> {
   const envelope = await storage.read(key);
   if (envelope === undefined) {
     throw new Error(`Fixture key "${key}" missing from storage`);
@@ -25,9 +25,9 @@ async function rawRead(
 }
 
 const record = (
-  overrides: Partial<StorageTransformRecord> = {},
-): StorageTransformRecord => ({
-  kind: "example:gzip",
+  overrides: Partial<CodecRecord> = {},
+): CodecRecord => ({
+  id: "example:gzip",
   version: "1.0.0",
   meta: {},
   ...overrides,
@@ -41,7 +41,7 @@ Deno.test("EX-GZIP-001 roundtrips the body verbatim and stamps meta.rawLength", 
   const storage = backing();
   const adapter = createExtendedStorage<string>({
     storage,
-    transforms: [gzip()],
+    codecs: [gzip()],
   });
   const messageKey = "message:greeting";
   const message = "hello";
@@ -50,31 +50,31 @@ Deno.test("EX-GZIP-001 roundtrips the body verbatim and stamps meta.rawLength", 
   assertEquals(await adapter.read(messageKey), message);
 
   const stored = await rawRead(storage, messageKey);
-  assertEquals(stored.transforms.map((r) => r.kind), ["example:gzip"]);
+  assertEquals(stored.codecs.map((r) => r.id), ["example:gzip"]);
   // The JSON text of "hello" is '"hello"': seven UTF-8 bytes with the quotes.
-  assertEquals(stored.transforms[0].meta, { rawLength: 7 });
+  assertEquals(stored.codecs[0].meta, { rawLength: 7 });
 });
 
 Deno.test("EX-GZIP-002 decode throws on an unsupported record version", async () => {
-  const transform = gzip();
-  const { body } = await transform.encode(new TextEncoder().encode("payload"));
+  const codec = gzip();
+  const { body } = await codec.encode(new TextEncoder().encode("payload"));
 
   await assertRejects(
-    () => Promise.resolve(transform.decode(body, record({ version: "2.0.0" }))),
+    () => Promise.resolve(codec.decode(body, record({ version: "2.0.0" }))),
     Error,
     "unsupported record version 2.0.0",
   );
 });
 
 Deno.test("EX-GZIP-003 decode throws on a tampered meta.rawLength", async () => {
-  const transform = gzip();
-  const { body } = await transform.encode(new TextEncoder().encode("payload"));
+  const codec = gzip();
+  const { body } = await codec.encode(new TextEncoder().encode("payload"));
 
   // Non-numeric rawLength is rejected before the length check.
   await assertRejects(
     () =>
       Promise.resolve(
-        transform.decode(body, record({ meta: { rawLength: "7" } })),
+        codec.decode(body, record({ meta: { rawLength: "7" } })),
       ),
     Error,
     "invalid meta.rawLength",
@@ -84,7 +84,7 @@ Deno.test("EX-GZIP-003 decode throws on a tampered meta.rawLength", async () => 
   await assertRejects(
     () =>
       Promise.resolve(
-        transform.decode(body, record({ meta: { rawLength: 999 } })),
+        codec.decode(body, record({ meta: { rawLength: 999 } })),
       ),
     Error,
     "expected 999",
@@ -109,7 +109,7 @@ Deno.test("EX-TTL-002 stamps meta.expiresAt and is metadata-only", async () => {
   const storage = backing();
   const adapter = createExtendedStorage<SessionData>({
     storage,
-    transforms: [ttl(60_000, "example:ttl", () => 1_000)],
+    codecs: [ttl(60_000, "example:ttl", () => 1_000)],
   });
   const key = "chat:1";
   const session: SessionData = { count: 1 };
@@ -117,7 +117,7 @@ Deno.test("EX-TTL-002 stamps meta.expiresAt and is metadata-only", async () => {
   await adapter.write(key, session);
 
   const stored = await rawRead(storage, key);
-  assertEquals(stored.transforms[0].meta, { expiresAt: 61_000 });
+  assertEquals(stored.codecs[0].meta, { expiresAt: 61_000 });
   // Body is untouched: reading it back yields the original value.
   assertEquals(await adapter.read(key), session);
 });
@@ -127,7 +127,7 @@ Deno.test("EX-TTL-003 an expired row reads back undefined and is deleted", async
   let now = 1_000;
   const adapter = createExtendedStorage<SessionData>({
     storage,
-    transforms: [ttl(100, "example:ttl", () => now)],
+    codecs: [ttl(100, "example:ttl", () => now)],
   });
   const key = "chat:1";
   const session: SessionData = { count: 1 };
@@ -144,7 +144,7 @@ Deno.test("EX-TTL-004 isExpired throws on malformed meta.expiresAt", async () =>
   const storage = backing();
   const adapter = createExtendedStorage<SessionData>({
     storage,
-    transforms: [ttl(100, "example:ttl", () => 1_000)],
+    codecs: [ttl(100, "example:ttl", () => 1_000)],
   });
   const key = "chat:1";
   await adapter.write(key, { count: 1 });
@@ -154,7 +154,7 @@ Deno.test("EX-TTL-004 isExpired throws on malformed meta.expiresAt", async () =>
   const stored = await rawRead(storage, key);
   await storage.write(key, {
     ...stored,
-    transforms: [{ ...stored.transforms[0], meta: { expiresAt: "soon" } }],
+    codecs: [{ ...stored.codecs[0], meta: { expiresAt: "soon" } }],
   });
 
   await assertRejects(
@@ -175,7 +175,7 @@ Deno.test("EX-CHAIN-001 gzip + ttl roundtrip on real grammY MemorySessionStorage
   let now = 1_000;
   const adapter = createExtendedStorage<SessionData>({
     storage,
-    transforms: [gzip(), ttl(60_000, "example:ttl", () => now)],
+    codecs: [gzip(), ttl(60_000, "example:ttl", () => now)],
   });
   const key = "chat:1";
   const session: SessionData = { count: 1 };
@@ -185,12 +185,12 @@ Deno.test("EX-CHAIN-001 gzip + ttl roundtrip on real grammY MemorySessionStorage
 
   const stored = await rawRead(storage, key);
   assertEquals(stored.encoding, "base64");
-  assertEquals(stored.transforms.map((r) => r.kind), [
+  assertEquals(stored.codecs.map((r) => r.id), [
     "example:gzip",
     "example:ttl",
   ]);
-  assert(typeof stored.transforms[0].meta.rawLength === "number");
-  assertEquals(stored.transforms[1].meta.expiresAt, 61_000);
+  assert(typeof stored.codecs[0].meta.rawLength === "number");
+  assertEquals(stored.codecs[1].meta.expiresAt, 61_000);
 
   now = 61_000; // written at t=1_000, so it expires at 61_000
   assertEquals(await adapter.read(key), undefined);

@@ -1,19 +1,19 @@
 import {
+  type BodyCodec,
+  type BodyDecoder,
+  type CodecRecord,
+  ENVELOPE_DISCRIMINATOR,
   PACKAGE_VERSION,
-  STORAGE_ENVELOPE_KIND,
-  type StorageEnvelope,
-  type StorageReadOnlyTransform,
-  type StorageTransform,
-  type StorageTransformRecord,
+  type SerializedEnvelope,
 } from "../src/mod.ts";
 
-export function validEnvelope(
-  overrides: Partial<StorageEnvelope> = {},
-): StorageEnvelope {
+export function validSerializedEnvelope(
+  overrides: Partial<SerializedEnvelope> = {},
+): SerializedEnvelope {
   return {
-    kind: STORAGE_ENVELOPE_KIND,
+    discriminator: ENVELOPE_DISCRIMINATOR,
     version: PACKAGE_VERSION,
-    transforms: [],
+    codecs: [],
     encoding: "utf8",
     body: JSON.stringify({ ok: true }),
     ...overrides,
@@ -21,13 +21,13 @@ export function validEnvelope(
 }
 
 export function record(
-  kind: string,
-  overrides: Partial<StorageTransformRecord> = {},
-): StorageTransformRecord {
-  return { kind, version: "1.0.0", meta: {}, ...overrides };
+  id: string,
+  overrides: Partial<CodecRecord> = {},
+): CodecRecord {
+  return { id, version: "1.0.0", meta: {}, ...overrides };
 }
 
-export type SpyTransformOptions = {
+export type SpyCodecOptions = {
   version?: string;
   /** Fixed meta attached on encode. */
   meta?: Record<string, unknown>;
@@ -36,25 +36,25 @@ export type SpyTransformOptions = {
   encodeAsync?: boolean;
   decodeAsync?: boolean;
   /** Attach an `isExpired` predicate. A boolean is returned as-is. */
-  expired?: boolean | ((record: StorageTransformRecord) => boolean);
+  expired?: boolean | ((record: CodecRecord) => boolean);
   onEncode?: (body: Uint8Array) => void;
-  onDecode?: (body: Uint8Array, record: StorageTransformRecord) => void;
+  onDecode?: (body: Uint8Array, record: CodecRecord) => void;
 };
 
-export type SpyTransform = StorageTransform & {
+export type SpyCodec = BodyCodec & {
   calls: { encode: number; decode: number; isExpired: number };
 };
 
-export function spyTransform(
-  kind: string,
-  options: SpyTransformOptions = {},
-): SpyTransform {
+export function spyCodec(
+  id: string,
+  options: SpyCodecOptions = {},
+): SpyCodec {
   const calls = { encode: 0, decode: 0, isExpired: 0 };
   const apply = (bytes: Uint8Array): Uint8Array =>
     options.reverse ? Uint8Array.from(bytes).reverse() : bytes;
 
-  const transform: StorageTransform = {
-    kind,
+  const codec: BodyCodec = {
+    id,
     version: options.version ?? "1.0.0",
     encode(body) {
       calls.encode++;
@@ -72,49 +72,49 @@ export function spyTransform(
 
   if (options.expired !== undefined) {
     const expired = options.expired;
-    transform.isExpired = (record) => {
+    codec.isExpired = (record) => {
       calls.isExpired++;
       return typeof expired === "function" ? expired(record) : expired;
     };
   }
 
-  return Object.assign(transform, { calls });
+  return Object.assign(codec, { calls });
 }
 
-// The gzip and ttl transforms are the canonical worked examples in `examples/`.
+// The gzip and ttl codecs are the canonical worked examples in `examples/`.
 // Re-export thin wrappers here so the test suite exercises the same code the
-// README documents, and old call sites keep their (kind, ttlMs, now) signatures.
+// README documents, and call sites keep their (id, ttlMs, now) signatures.
 import { gzip } from "../examples/gzip.ts";
 import { ttl } from "../examples/ttl.ts";
 
-export function ttlTransform(
-  kind: string,
+export function ttlCodec(
+  id: string,
   ttlMs: number,
   now: () => number = Date.now,
-): StorageTransform {
-  return ttl(ttlMs, kind, now);
+): BodyCodec {
+  return ttl(ttlMs, id, now);
 }
 
-export function gzipTransform(kind = "gzip"): StorageTransform {
-  return gzip(kind);
+export function gzipCodec(id = "gzip"): BodyCodec {
+  return gzip(id);
 }
 
-export type ReadOnlySpy = StorageReadOnlyTransform & {
+export type ReadOnlySpy = BodyDecoder & {
   calls: { decode: number; isExpired: number };
 };
 
-/** A decode-only transform with no `encode`, for `readOnlyTransforms`. */
+/** A decode-only codec with no `encode`, for `decoders`. */
 export function readOnlySpy(
-  kind: string,
+  id: string,
   options: {
     reverse?: boolean;
-    expired?: boolean | ((record: StorageTransformRecord) => boolean);
-    onDecode?: (body: Uint8Array, record: StorageTransformRecord) => void;
+    expired?: boolean | ((record: CodecRecord) => boolean);
+    onDecode?: (body: Uint8Array, record: CodecRecord) => void;
   } = {},
 ): ReadOnlySpy {
   const calls = { decode: 0, isExpired: 0 };
-  const transform: StorageReadOnlyTransform = {
-    kind,
+  const decoder: BodyDecoder = {
+    id,
     decode(body, record) {
       calls.decode++;
       options.onDecode?.(body, record);
@@ -123,10 +123,10 @@ export function readOnlySpy(
   };
   if (options.expired !== undefined) {
     const expired = options.expired;
-    transform.isExpired = (record) => {
+    decoder.isExpired = (record) => {
       calls.isExpired++;
       return typeof expired === "function" ? expired(record) : expired;
     };
   }
-  return Object.assign(transform, { calls });
+  return Object.assign(decoder, { calls });
 }

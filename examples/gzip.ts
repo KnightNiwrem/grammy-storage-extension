@@ -1,15 +1,15 @@
 /**
- * Worked example: a gzip body transform.
+ * Worked example: a gzip body codec.
  *
- * A complete, runnable {@link StorageTransform} built on the platform
+ * A complete, runnable {@link BodyCodec} built on the platform
  * `CompressionStream`/`DecompressionStream`. It rejects record versions it does
  * not understand and validates the untrusted field it reads back
  * (`record.meta.rawLength`) rather than trusting it blindly.
  *
  * Because compression raises entropy, place `gzip()` **before** any encryption
- * transform in your `transforms` list (see `spec.md` §7.7).
+ * codec in your `codecs` list (see `spec.md` §7.7).
  */
-import type { StorageTransform } from "../src/mod.ts";
+import type { BodyCodec } from "../src/mod.ts";
 
 /** Pump `bytes` through a (de)compression stream and collect the result. */
 async function pipeThrough(
@@ -20,9 +20,9 @@ async function pipeThrough(
   return new Uint8Array(await new Response(source).arrayBuffer());
 }
 
-export function gzip(kind = "example:gzip"): StorageTransform {
+export function gzip(id = "example:gzip"): BodyCodec {
   return {
-    kind,
+    id,
     version: "1.0.0",
     async encode(body) {
       return {
@@ -34,7 +34,7 @@ export function gzip(kind = "example:gzip"): StorageTransform {
       // Reject record versions this decode does not understand.
       if (record.version !== "1.0.0") {
         throw new Error(
-          `${record.kind}: unsupported record version ${record.version}`,
+          `${record.id}: unsupported record version ${record.version}`,
         );
       }
       const restored = await pipeThrough(body, new DecompressionStream("gzip"));
@@ -46,12 +46,12 @@ export function gzip(kind = "example:gzip"): StorageTransform {
         expected < 0
       ) {
         throw new Error(
-          `${record.kind}: invalid meta.rawLength ${JSON.stringify(expected)}`,
+          `${record.id}: invalid meta.rawLength ${JSON.stringify(expected)}`,
         );
       }
       if (restored.byteLength !== expected) {
         throw new Error(
-          `${record.kind}: decoded ${restored.byteLength} bytes, expected ${expected}`,
+          `${record.id}: decoded ${restored.byteLength} bytes, expected ${expected}`,
         );
       }
       return restored;

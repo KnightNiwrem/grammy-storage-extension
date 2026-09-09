@@ -1,8 +1,8 @@
 /**
  * Quick-start example: wrap a grammY session in validated envelopes.
  *
- * With an empty transform list the wrapper just stores your session values in
- * envelopes as-is — you do not have to write a transform to use it. Swap
+ * With an empty codec list the wrapper just stores your session values in
+ * envelopes as-is — you do not have to write a codec to use it. Swap
  * `MemorySessionStorage` for any grammY storage adapter (Redis, MongoDB,
  * Deno KV, …); it is used here for demonstration only and loses all contents
  * when the process restarts.
@@ -15,19 +15,19 @@
  */
 import { Bot, type Context, session, type SessionFlavor } from "grammy";
 import { MemorySessionStorage } from "grammy";
-import { createExtendedStorage, type StorageEnvelope } from "../src/mod.ts";
+import { createExtendedStorage, type SerializedEnvelope } from "../src/mod.ts";
 
 interface SessionData {
   count: number;
 }
 type MyContext = Context & SessionFlavor<SessionData>;
 
-// The backing adapter stores StorageEnvelope values.
-const backing = new MemorySessionStorage<StorageEnvelope>();
+// The backing adapter stores SerializedEnvelope values.
+const backing = new MemorySessionStorage<SerializedEnvelope>();
 
 const storage = createExtendedStorage<SessionData>({
   storage: backing,
-  transforms: [], // no transforms yet: values are wrapped but otherwise unchanged
+  codecs: [], // no codecs yet: values are wrapped but otherwise unchanged
 });
 
 const bot = new Bot<MyContext>(""); // <-- your bot token

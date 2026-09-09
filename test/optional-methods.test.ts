@@ -1,30 +1,30 @@
 import { assert, assertEquals, assertStrictEquals } from "@std/assert";
 import { MemorySessionStorage, type StorageAdapter } from "grammy";
 
-import { createExtendedStorage, type StorageEnvelope } from "../src/mod.ts";
+import { createExtendedStorage, type SerializedEnvelope } from "../src/mod.ts";
 import {
   record,
-  type SpyTransform,
-  spyTransform,
-  validEnvelope,
+  type SpyCodec,
+  spyCodec,
+  validSerializedEnvelope,
 } from "./helpers.ts";
 
 type FlexibleIterable<T> = Iterable<T> | AsyncIterable<T>;
 
-type FlexibleStorage = StorageAdapter<StorageEnvelope> & {
+type FlexibleStorage = StorageAdapter<SerializedEnvelope> & {
   read(
     key: string,
-  ): StorageEnvelope | undefined | Promise<StorageEnvelope | undefined>;
-  write(key: string, value: StorageEnvelope): void | Promise<void>;
+  ): SerializedEnvelope | undefined | Promise<SerializedEnvelope | undefined>;
+  write(key: string, value: SerializedEnvelope): void | Promise<void>;
   delete(key: string): void | Promise<void>;
   has?: (key: string) => boolean | Promise<boolean>;
   readAllKeys?: () => FlexibleIterable<string>;
-  readAllValues?: () => FlexibleIterable<StorageEnvelope>;
-  readAllEntries?: () => FlexibleIterable<[string, StorageEnvelope]>;
+  readAllValues?: () => FlexibleIterable<SerializedEnvelope>;
+  readAllEntries?: () => FlexibleIterable<[string, SerializedEnvelope]>;
 };
 
 function backing(): FlexibleStorage {
-  return new MemorySessionStorage<StorageEnvelope>() as FlexibleStorage;
+  return new MemorySessionStorage<SerializedEnvelope>() as FlexibleStorage;
 }
 
 function setMethods(
@@ -43,11 +43,11 @@ function setMethods(
  */
 type FixtureValue = { value: number } | string[];
 
-/** Transforms shared by every fixture: a body-changing one and an expiry one. */
-function fixtureTransforms(): { rev: SpyTransform; ttl: SpyTransform } {
+/** Codecs shared by every fixture: a body-changing one and an expiry one. */
+function fixtureCodecs(): { rev: SpyCodec; ttl: SpyCodec } {
   return {
-    rev: spyTransform("rev", { reverse: true }),
-    ttl: spyTransform("ttl", {
+    rev: spyCodec("rev", { reverse: true }),
+    ttl: spyCodec("ttl", {
       expired: (r) => r.meta.dead === true,
     }),
   };
@@ -59,27 +59,27 @@ function fixtureTransforms(): { rev: SpyTransform; ttl: SpyTransform } {
  */
 async function writeOptionalFixtures(
   storage: FlexibleStorage,
-  transforms: { rev: SpyTransform; ttl: SpyTransform },
+  codecs: { rev: SpyCodec; ttl: SpyCodec },
 ): Promise<{
-  entries: Array<[string, StorageEnvelope]>;
+  entries: Array<[string, SerializedEnvelope]>;
   keys: string[];
-  values: StorageEnvelope[];
+  values: SerializedEnvelope[];
 }> {
   const writer = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
   await writer.write("a", { value: 1 });
   await storage.write(
     "gone",
-    validEnvelope({
-      transforms: [record("ttl", { meta: { dead: true } })],
+    validSerializedEnvelope({
+      codecs: [record("ttl", { meta: { dead: true } })],
       body: "0",
     }),
   );
   await writer.write("b", ["two"]);
 
-  const entries: Array<[string, StorageEnvelope]> = [];
+  const entries: Array<[string, SerializedEnvelope]> = [];
   for (const key of ["a", "gone", "b"]) {
     const envelope = await storage.read(key);
     if (envelope === undefined) {
@@ -119,37 +119,37 @@ function readsOf(storage: FlexibleStorage): { count: number } {
 
 Deno.test("VAL-OPT-001 has reports live entries without decoding the body", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  await writeOptionalFixtures(storage, transforms);
-  transforms.rev.calls.decode = 0;
+  const codecs = fixtureCodecs();
+  await writeOptionalFixtures(storage, codecs);
+  codecs.rev.calls.decode = 0;
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   assertEquals(await adapter.has!("a"), true);
   assertEquals(await adapter.has!("missing"), false);
-  assertEquals(transforms.rev.calls.decode, 0);
+  assertEquals(codecs.rev.calls.decode, 0);
 });
 
 Deno.test("VAL-OPT-002 has reports expired entries as absent and cleans them up", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  await writeOptionalFixtures(storage, codecs);
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   assertEquals(await adapter.has!("gone"), false);
   assertEquals(await storage.read("gone"), undefined);
-  assertEquals(transforms.rev.calls.decode, 0);
+  assertEquals(codecs.rev.calls.decode, 0);
 });
 
 Deno.test("VAL-OPT-003 has does not forward to the backing has", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  await writeOptionalFixtures(storage, codecs);
   let backingHasCalls = 0;
   setMethods(storage, {
     has: () => {
@@ -159,7 +159,7 @@ Deno.test("VAL-OPT-003 has does not forward to the backing has", async () => {
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   assertEquals(await adapter.has!("gone"), false);
@@ -183,8 +183,8 @@ Deno.test("VAL-OPT-004 has is exposed when the backing adapter does not expose h
 
 Deno.test("VAL-OPT-005 readAllKeys from entries yields live keys without decoding bodies", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   setMethods(storage, {
     readAllKeys: undefined,
     readAllValues: undefined,
@@ -192,18 +192,18 @@ Deno.test("VAL-OPT-005 readAllKeys from entries yields live keys without decodin
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   assertEquals(await collectAsync(adapter.readAllKeys!()), ["a", "b"]);
-  assertEquals(transforms.rev.calls.decode, 0);
+  assertEquals(codecs.rev.calls.decode, 0);
   assertEquals(await storage.read("gone"), undefined);
 });
 
 Deno.test("VAL-OPT-006 readAllKeys from keys uses has per key", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   setMethods(storage, {
     readAllKeys: () => fixtures.keys,
     readAllValues: undefined,
@@ -211,11 +211,11 @@ Deno.test("VAL-OPT-006 readAllKeys from keys uses has per key", async () => {
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   assertEquals(await collectAsync(adapter.readAllKeys!()), ["a", "b"]);
-  assertEquals(transforms.rev.calls.decode, 0);
+  assertEquals(codecs.rev.calls.decode, 0);
   assertEquals(await storage.read("gone"), undefined);
 });
 
@@ -235,8 +235,8 @@ Deno.test("VAL-OPT-007 readAllKeys is omitted without all-key or all-entry capab
 
 Deno.test("VAL-OPT-008 readAllValues from entries yields decoded live values and cleans up expired keys", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   setMethods(storage, {
     readAllKeys: undefined,
     readAllValues: undefined,
@@ -244,7 +244,7 @@ Deno.test("VAL-OPT-008 readAllValues from entries yields decoded live values and
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   assertEquals(await collectAsync(adapter.readAllValues!()), [
@@ -256,8 +256,8 @@ Deno.test("VAL-OPT-008 readAllValues from entries yields decoded live values and
 
 Deno.test("VAL-OPT-009 readAllValues from values filters expired entries but cannot clean them up", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   setMethods(storage, {
     readAllKeys: undefined,
     readAllValues: () => fixtures.values,
@@ -265,7 +265,7 @@ Deno.test("VAL-OPT-009 readAllValues from values filters expired entries but can
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   assertEquals(await collectAsync(adapter.readAllValues!()), [
@@ -277,8 +277,8 @@ Deno.test("VAL-OPT-009 readAllValues from values filters expired entries but can
 
 Deno.test("VAL-OPT-010 readAllValues from keys reads each key and cleans up expired keys", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   setMethods(storage, {
     readAllKeys: () => fixtures.keys,
     readAllValues: undefined,
@@ -286,7 +286,7 @@ Deno.test("VAL-OPT-010 readAllValues from keys reads each key and cleans up expi
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
   const reads = readsOf(storage);
 
@@ -311,8 +311,8 @@ Deno.test("VAL-OPT-010b readAllValues is omitted without values, entries, or key
 
 Deno.test("VAL-OPT-010c readAllValues prefers backing readAllValues over keys", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   const calls = { keys: 0, values: 0 };
   setMethods(storage, {
     readAllKeys: () => {
@@ -327,7 +327,7 @@ Deno.test("VAL-OPT-010c readAllValues prefers backing readAllValues over keys", 
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   await collectAsync(adapter.readAllValues!());
@@ -341,8 +341,8 @@ Deno.test("VAL-OPT-010c readAllValues prefers backing readAllValues over keys", 
 
 Deno.test("VAL-OPT-011 readAllEntries from entries yields decoded live pairs and cleans up expired keys", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   setMethods(storage, {
     readAllKeys: undefined,
     readAllValues: undefined,
@@ -350,7 +350,7 @@ Deno.test("VAL-OPT-011 readAllEntries from entries yields decoded live pairs and
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   assertEquals(await collectAsync(adapter.readAllEntries!()), [
@@ -362,8 +362,8 @@ Deno.test("VAL-OPT-011 readAllEntries from entries yields decoded live pairs and
 
 Deno.test("VAL-OPT-012 readAllEntries from keys reads each key", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   setMethods(storage, {
     readAllKeys: () => fixtures.keys,
     readAllValues: undefined,
@@ -371,7 +371,7 @@ Deno.test("VAL-OPT-012 readAllEntries from keys reads each key", async () => {
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
   const reads = readsOf(storage);
 
@@ -399,8 +399,8 @@ Deno.test("VAL-OPT-013 readAllEntries is omitted without entries or key-read der
 
 Deno.test("VAL-OPT-014 bulk methods are async-iterable when backing iterables are synchronous", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   setMethods(storage, {
     readAllKeys: () => fixtures.keys,
     readAllValues: () => fixtures.values,
@@ -408,7 +408,7 @@ Deno.test("VAL-OPT-014 bulk methods are async-iterable when backing iterables ar
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   for (
@@ -426,8 +426,8 @@ Deno.test("VAL-OPT-014 bulk methods are async-iterable when backing iterables ar
 
 Deno.test("VAL-OPT-015 bulk methods prefer readAllEntries when backing exposes all bulk capabilities", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   const calls = { keys: 0, values: 0, entries: 0 };
   setMethods(storage, {
     readAllKeys: () => {
@@ -445,7 +445,7 @@ Deno.test("VAL-OPT-015 bulk methods prefer readAllEntries when backing exposes a
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   await collectAsync(adapter.readAllKeys!());
@@ -457,8 +457,8 @@ Deno.test("VAL-OPT-015 bulk methods prefer readAllEntries when backing exposes a
 
 Deno.test("VAL-OPT-016 bulk iteration ignores cleanup delete failures", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
   setMethods(storage, {
     readAllEntries: () => fixtures.entries,
     delete: () => {
@@ -467,7 +467,7 @@ Deno.test("VAL-OPT-016 bulk iteration ignores cleanup delete failures", async ()
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   assertEquals(await collectAsync(adapter.readAllKeys!()), ["a", "b"]);
@@ -479,15 +479,15 @@ Deno.test("VAL-OPT-016 bulk iteration ignores cleanup delete failures", async ()
 
 Deno.test("VAL-OPT-017 bulk iteration is fail-fast on a corrupt entry", async () => {
   const storage = backing();
-  const transforms = fixtureTransforms();
-  const fixtures = await writeOptionalFixtures(storage, transforms);
-  const corrupt = validEnvelope({ transforms: [record("ghost")] });
+  const codecs = fixtureCodecs();
+  const fixtures = await writeOptionalFixtures(storage, codecs);
+  const corrupt = validSerializedEnvelope({ codecs: [record("ghost")] });
   setMethods(storage, {
     readAllEntries: () => [fixtures.entries[0], ["bad", corrupt]],
   });
   const adapter = createExtendedStorage<FixtureValue>({
     storage,
-    transforms: [transforms.rev, transforms.ttl],
+    codecs: [codecs.rev, codecs.ttl],
   });
 
   const seen: string[] = [];
