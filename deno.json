@@ -1,5 +1,5 @@
 {
-  "name": "@grammyjs/storage-extended",
+  "name": "grammy-storage-extension",
   "version": "0.1.0",
   "license": "MIT",
   "lock": false,
@@ -10,8 +10,7 @@
     "test": "deno test --allow-env --allow-import=cdn.jsdelivr.net,jsr.io,cdn.skypack.dev",
     "check": "deno check --allow-import=cdn.jsdelivr.net,jsr.io,cdn.skypack.dev src/mod.ts test/ examples/",
     "lint": "deno lint",
-    "fmt:check": "deno fmt --check",
-    "publish:dry": "deno publish --dry-run --allow-dirty"
+    "fmt:check": "deno fmt --check"
   },
   "imports": {
     "@std/assert": "jsr:@std/assert@1",

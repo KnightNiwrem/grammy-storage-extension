@@ -1,6 +1,6 @@
 # grammY Storage Extended
 
-`@grammyjs/storage-extended` wraps any grammY
+`grammy-storage-extension` wraps any grammY
 [`StorageAdapter`](https://grammy.dev/plugins/session) so that session values
 are stored inside validated **envelopes**. On write it runs an ordered list of
 body **transforms** (compression, encryption, expiry, …); on read it undoes them
@@ -26,24 +26,31 @@ decompression or decryption.
 Pre-1.0 and **not yet published to a registry**. The public API (`spec.md` §3)
 and the stored envelope format may still change without a migration path until
 the version in [`deno.json`](./deno.json) reaches `1.0.0`. Until it is
-published, depend on it by Git URL or a local path rather than the `jsr:`
-specifier below.
+published, depend on it via the jsDelivr URL in [Install](#install), a Git URL,
+or a local path.
 
 Written for and tested on **Deno** (CI runs Deno `v2.x`). It has no
 Node-specific dependencies, but Node/Bun compatibility is not yet part of the
-test matrix.
+test matrix. A scoped JSR package usable from Deno, Node.js, and Bun is planned.
 
 ## Install
 
-> Once published, install from [JSR](https://jsr.io/):
->
-> ```sh
-> deno add jsr:@grammyjs/storage-extended   # Deno
-> npx jsr add @grammyjs/storage-extended     # Node / Bun
+This package is not published to a registry yet. The supported interim path is a
+**direct URL import under Deno**, serving this GitHub repo through a CDN such as
+[jsDelivr](https://www.jsdelivr.com/):
+
+> ```ts
+> // Pin a tag or commit in place of <ref> for reproducible builds.
+> import { createExtendedStorage } from "https://cdn.jsdelivr.net/gh/KnightNiwrem/grammy-storage-extension@<ref>/src/mod.ts";
 > ```
 
-All examples below import from `@grammyjs/storage-extended`; map that specifier
-to your install method (JSR once published, otherwise a Git URL or local path).
+This URL import works under Deno. It is not usable from Node.js, which does not
+resolve `https:` ESM specifiers through its default loader; Node.js and Bun will
+be supported by the planned scoped JSR release (see [Status](#status)).
+
+The examples below import from the bare specifier `grammy-storage-extension`;
+map that to your setup — the jsDelivr URL above, an import-map/`deno.json`
+alias, a Git URL, or a local path.
 
 ## Quick start
 
@@ -230,7 +237,7 @@ everything you need.
 import type {
   StorageTransform,
   StorageTransformRecord,
-} from "@grammyjs/storage-extended";
+} from "grammy-storage-extension";
 ```
 
 - **`kind: string`** — a stable, globally unique identifier for this transform
@@ -307,7 +314,7 @@ actually runs.
 - **Expiry.** If you expose `isExpired`, test that it reads only the record,
   that a `true` result deletes the row and yields `undefined` from `read`, and
   that `has` reports it absent without decoding the body.
-- **Distribute** as its own package that depends on `@grammyjs/storage-extended`
+- **Distribute** as its own package that depends on `grammy-storage-extension`
   for the `StorageTransform` type. Publish your `kind` in the README so
   consumers can recognize your rows in stored envelopes.
 
