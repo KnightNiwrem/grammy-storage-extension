@@ -317,7 +317,7 @@ Local checks (see [`deno.json`](./deno.json)):
 
 ```sh
 deno task test      # run the test suite
-deno task check     # type-check src/mod.ts and test/
+deno task check     # type-check src/mod.ts, test/, and examples/
 deno task lint
 deno task fmt:check
 ```

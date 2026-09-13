@@ -20,6 +20,29 @@
   linting, and type-checking conventions. Run checks appropriate to the change
   and report failures or checks not run.
 
+## Completion
+
+For implementation tasks, continue through implementation, relevant
+verification, and correction of issues introduced by the change. All code
+intended for commit, including tests, helpers, and examples, is a deliverable:
+review it for correctness, readability, meaningful names, and coherent design
+before finishing. Keep improvements within the requested scope and report
+unresolved blockers.
+
+## Behavioral contract
+
+Use the relevant sections of `spec.md` as the behavioral contract. When the task
+intentionally changes that contract, update the specification, implementation,
+affected tests, and documentation together.
+
+| Work                                   | Relevant specification |
+| :------------------------------------- | :--------------------- |
+| Public API or envelope format          | §§3–6                  |
+| Codec behavior and registration        | §§7–8                  |
+| Read/write ordering and expiry         | §§9–11                 |
+| Optional methods and error propagation | §§12–13                |
+| Proposed feature expansion             | §14: non-goals         |
+
 ## Project status & breaking changes
 
 This package is pre-1.0 (see `version` in `deno.json`) and not yet published.
@@ -32,31 +55,28 @@ story (e.g. a new envelope `discriminator` value).
 
 ## Distribution
 
-The package name is the unscoped `grammy-storage-extension` (it also serves as
-the `ENVELOPE_DISCRIMINATOR` value). Distribution has two stages; do not read
-the current stage as cancelling the intended one:
+Deno is currently supported; scoped JSR distribution and Node.js/Bun support are
+planned. Direct URL imports are the interim Deno installation path. Registry
+publication and a `publish` task remain deferred until a valid scoped name is
+chosen. For distribution changes, consult README's [Status](README.md#status)
+and [Install](README.md#install) sections and verify any newly claimed runtime
+support.
 
-| Concern              | Current                                                          | Intended                   |
-| :------------------- | :--------------------------------------------------------------- | :------------------------- |
-| Supported runtime    | Deno                                                             | Deno, Node.js, and Bun     |
-| Installation         | Direct URL import under Deno (jsDelivr/GitHub) or local checkout | Scoped package on JSR      |
-| Registry publication | Deferred until a scoped name is chosen                           | Planned; **not** cancelled |
-
-Constraints that drive this:
-
-- JSR requires the `@scope/name` format, which the unscoped
-  `grammy-storage-extension` does not satisfy — so JSR publication waits on
-  choosing a scoped registry name. There is no `publish` task while the name is
-  unscoped (a `deno publish` would fail); add one only once a valid scoped name
-  exists.
-- The jsDelivr URL import is a **Deno-only** interim path. Node.js does not
-  resolve `https:` ESM specifiers through its default loader, so this path does
-  not establish Node.js/Bun support. Do not infer cross-runtime compatibility
-  from it; that support arrives with the scoped JSR release, and Node/Bun are
-  not yet in the test matrix.
+The package name and `ENVELOPE_DISCRIMINATOR` are currently
+`grammy-storage-extension`. When choosing a scoped package name, explicitly
+decide whether the stored discriminator changes too.
 
 ## Checks
 
 - `deno task test` — run the test suite.
-- `deno task check` — type-check `src/mod.ts` and `test/`.
+- `deno task check` — type-check `src/mod.ts`, `test/`, and `examples/`.
 - `deno task lint` / `deno task fmt:check`
+
+The test suite uses in-memory fixtures and requires no live bot or database.
+Dependency downloads may require network access. Run relevant checks, fix
+failures introduced by the requested change, and rerun affected checks without
+asking at each step. Running `examples/quick-start.ts` against a live Telegram
+bot requires authorization for live testing.
+
+Use focused checks while iterating and run all four tasks before opening a pull
+request. Rerun checks affected by subsequent edits.
